@@ -297,37 +297,41 @@ class FrameProcessor:
         """Compose frame using HTML template"""
         from pixelle_video.services.frame_html import HTMLFrameGenerator
         from pixelle_video.utils.template_util import resolve_template_path
-        
+        from pixelle_video.utils.subtitle import format_subtitle_text
+
         # Resolve template path (handles various input formats)
         template_path = resolve_template_path(config.frame_template)
-        
-        # Get content metadata from storyboard
-        content_metadata = storyboard.content_metadata if storyboard else None
-        
+
         # Build ext data
         ext = {
             "index": frame.index + 1,
         }
-        
-        # Add custom template parameters
+
+        # Add custom template parameters (includes subtitle CSS vars if set)
         if config.template_params:
             ext.update(config.template_params)
-        
+
+        # Apply subtitle text formatting (Python-side line/char limits)
+        template_params = config.template_params or {}
+        max_lines = int(template_params.get("_subtitle_max_lines", 2))
+        chars_per_line = int(template_params.get("_subtitle_chars_per_line", 20))
+        formatted_text = format_subtitle_text(frame.narration, max_lines, chars_per_line)
+
         # Generate frame using HTML (size is auto-parsed from template path)
         generator = HTMLFrameGenerator(template_path)
-        
+
         # Use video_path for video media, image_path for images
         media_path = frame.video_path if frame.media_type == "video" else frame.image_path
         logger.debug(f"Generating frame with media: '{media_path}' (type: {frame.media_type})")
-        
+
         composed_path = await generator.generate_frame(
             title=storyboard.title,
-            text=frame.narration,
-            image=media_path,  # HTMLFrameGenerator handles both image and video paths
+            text=formatted_text,
+            image=media_path,
             ext=ext,
             output_path=output_path
         )
-        
+
         return composed_path
     
     async def _step_create_video_segment(

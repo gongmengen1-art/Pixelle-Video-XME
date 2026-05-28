@@ -27,10 +27,7 @@
             overflow: hidden;
         }
 
-        /* 1. Background Media Layer (背景媒体层) 
-           - For image assets: displays the image
-           - For video assets: hidden (video is composited in later step)
-        */
+        /* Background Media Layer */
         .background-layer {
             position: absolute;
             top: 0;
@@ -47,17 +44,11 @@
             display: block;
         }
 
-        /* Hide background layer when no image (video mode) */
         .background-layer:empty {
             display: none;
         }
 
-        /* 2. Gradient Overlay (渐变遮罩) 
-           Ensures text readability regardless of background brightness
-           Top: Darker for Title
-           Middle: Transparent for Media visibility
-           Bottom: Darker for Subtitles
-        */
+        /* Gradient overlay for readability */
         .gradient-overlay {
             position: absolute;
             top: 0;
@@ -66,107 +57,59 @@
             height: 100%;
             z-index: 1;
             background: linear-gradient(to bottom,
-                    rgba(0, 0, 0, 0.6) 0%,
-                    rgba(0, 0, 0, 0.1) 25%,
-                    rgba(0, 0, 0, 0.1) 60%,
-                    rgba(0, 0, 0, 0.8) 100%);
+                    rgba(0, 0, 0, 0.15) 0%,
+                    rgba(0, 0, 0, 0.0) 25%,
+                    rgba(0, 0, 0, 0.0) 60%,
+                    rgba(0, 0, 0, 0.65) 100%);
         }
 
-        /* 3. Content Layer (内容层) */
-        .content-layer {
-            position: relative;
-            z-index: 2;
-            width: 100%;
-            height: 100%;
-            padding: 120px 80px 0px 80px;
-            /* Top, Right, Bottom, Left */
-            box-sizing: border-box;
-            display: flex;
-            flex-direction: column;
-            justify-content: flex-start;
-            color: #ffffff;
-        }
-
-        /* Title Styling */
-        .video-title {
-            font-size: 80px;
-            font-weight: 700;
-            line-height: 1.2;
-            text-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
-            margin-bottom: 40px;
-            text-align: center;
-        }
-
-        /* Hide title when empty */
-        .video-title:empty {
-            display: none;
-        }
-
-        /* Flex spacer to push subtitle to bottom */
-        .spacer {
-            flex-grow: 1;
-        }
-
-        /* Narration/Subtitle Styling */
+        /* Subtitle wrapper — position injected via {{subtitle_position_css}} */
         .subtitle-wrapper {
-            margin-bottom: 60px;
+            position: absolute;
+            left: 80px;
+            right: 80px;
+            z-index: 2;
+            text-align: center;
+            {{subtitle_position_css}}
         }
 
+        /* Subtitle text — style injected via {{subtitle_style_css}} */
         .text {
             font-size: 52px;
             font-weight: 500;
             line-height: 1.6;
             text-align: center;
-            text-shadow: 0 2px 8px rgba(0, 0, 0, 0.6);
-            backdrop-filter: blur(4px);
+            word-break: break-all;
+            white-space: pre-line;
+            {{subtitle_style_css}}
         }
     </style>
 </head>
 
 <body>
     <div class="page-container">
-        <!-- Background Media Layer 
-             - For image assets: contains <img> tag
-             - For video assets: empty (hidden by CSS)
-        -->
-        <div class="background-layer" id="bg-layer">
-            <!-- Image will be inserted here for image assets only -->
-        </div>
+        <!-- Background: image for image assets, empty (hidden) for video assets -->
+        <div class="background-layer" id="bg-layer"></div>
 
-        <!-- Shadow Overlay for Text Readability -->
+        <!-- Gradient overlay -->
         <div class="gradient-overlay"></div>
 
-        <!-- Main Content -->
-        <div class="content-layer">
-            <!-- Top Section: Title -->
-            <div class="video-title">
-                {{title}}
-            </div>
-
-            <!-- Spacer pushes content apart -->
-            <div class="spacer"></div>
-
-            <!-- Bottom Section: Narration/Text -->
-            <div class="subtitle-wrapper">
-                <div class="text">{{text}}</div>
-            </div>
+        <!-- Subtitle -->
+        <div class="subtitle-wrapper">
+            <div class="text">{{text}}</div>
         </div>
     </div>
 
     <script>
-        // Conditionally add image if provided
         (function () {
             var imageUrl = "{{image}}";
             var bgLayer = document.getElementById('bg-layer');
-
-            // Only add img tag if image URL is provided and not empty
             if (imageUrl && imageUrl.trim() !== "" && imageUrl !== "None") {
                 var img = document.createElement('img');
                 img.src = imageUrl;
                 img.alt = "Background";
                 bgLayer.appendChild(img);
             }
-            // Otherwise, bg-layer stays empty and gets hidden by CSS
         })();
     </script>
 </body>

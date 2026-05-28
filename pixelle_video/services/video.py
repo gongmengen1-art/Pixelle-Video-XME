@@ -252,6 +252,138 @@ class VideoService:
             logger.error(f"Concatenation error: {e}")
             raise RuntimeError(f"Failed to concatenate videos: {e}")
     
+    def concat_videos_with_transition(
+        self,
+        videos: List[str],
+        output: str,
+        transition: str = "fade",
+        transition_duration: float = 0.5,
+        bgm_path: Optional[str] = None,
+        bgm_volume: float = 0.2,
+        bgm_mode: Literal["once", "loop"] = "loop"
+    ) -> str:
+        """
+        Concatenate videos with xfade/acrossfade transition between each clip.
+
+        Uses ffmpeg xfade (video) + acrossfade (audio) filters to produce smooth
+        transitions instead of hard cuts.  Re-encodes all clips to ensure consistent
+        codec/fps/pixel-format — this also eliminates the keyframe-alignment stutter
+        that the demuxer copy approach produces.
+
+        Args:
+            videos: Ordered list of video file paths
+            output: Output video file path
+            transition: xfade transition name (default: "fade")
+            transition_duration: Duration of each transition in seconds (default: 0.5)
+            bgm_path: Optional background music file or preset name
+            bgm_volume: BGM volume (0.0–1.0)
+            bgm_mode: "loop" or "once"
+
+        Returns:
+            Path to the output video
+        """
+        self._ensure_ffmpeg()
+
+        if not videos:
+            raise ValueError("Videos list cannot be empty")
+
+        if len(videos) == 1:
+            shutil.copy(videos[0], output)
+            return output
+
+        logger.info(
+            f"Concatenating {len(videos)} videos with '{transition}' transition "
+            f"({transition_duration}s)"
+        )
+
+        import subprocess
+
+        # Measure duration of every clip
+        durations = [self._get_video_duration(v) for v in videos]
+        logger.debug(f"Clip durations: {[f'{d:.2f}s' for d in durations]}")
+
+        # Cap transition to half of the shortest clip to avoid artefacts
+        min_dur = min(durations)
+        t = min(transition_duration, min_dur / 2 - 0.05)
+        t = max(t, 0.1)
+        if t < transition_duration:
+            logger.warning(
+                f"Transition capped to {t:.3f}s "
+                f"(shortest clip: {min_dur:.2f}s)"
+            )
+
+        n = len(videos)
+        filter_parts = []
+
+        # Video xfade chain: cumulative offset accounts for previous overlaps
+        v_in = "[0:v]"
+        cumulative_offset = 0.0
+        for i in range(1, n):
+            cumulative_offset += durations[i - 1] - t
+            v_out = "[v]" if i == n - 1 else f"[vx{i}]"
+            filter_parts.append(
+                f"{v_in}[{i}:v]xfade="
+                f"transition={transition}:"
+                f"duration={t:.3f}:"
+                f"offset={cumulative_offset:.3f}"
+                f"{v_out}"
+            )
+            v_in = v_out
+
+        # Audio acrossfade chain
+        a_in = "[0:a]"
+        for i in range(1, n):
+            a_out = "[a]" if i == n - 1 else f"[ax{i}]"
+            filter_parts.append(
+                f"{a_in}[{i}:a]acrossfade=d={t:.3f}{a_out}"
+            )
+            a_in = a_out
+
+        filter_complex = ";".join(filter_parts)
+
+        # If BGM is needed, write to a temp file first
+        concat_output = output.replace(".mp4", "_no_bgm.mp4") if bgm_path else output
+
+        cmd = ["ffmpeg"]
+        for v in videos:
+            cmd.extend(["-i", v])
+        cmd.extend([
+            "-filter_complex", filter_complex,
+            "-map", "[v]",
+            "-map", "[a]",
+            "-vcodec", "libx264",
+            "-acodec", "aac",
+            "-pix_fmt", "yuv420p",
+            "-crf", "23",
+            "-preset", "medium",
+            "-y",
+            concat_output,
+        ])
+
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            logger.success(f"Videos concatenated with transition: {concat_output}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"FFmpeg xfade error: {e.stderr}")
+            raise RuntimeError(
+                f"Failed to concatenate videos with transition: {e.stderr}"
+            )
+
+        # Optionally layer BGM on top
+        if bgm_path:
+            logger.info(f"Adding BGM: {bgm_path}")
+            self._add_bgm_to_video(
+                video=concat_output,
+                bgm_path=bgm_path,
+                output=output,
+                volume=bgm_volume,
+                mode=bgm_mode,
+            )
+            if os.path.exists(concat_output):
+                os.unlink(concat_output)
+
+        return output
+
     def _get_video_duration(self, video: str) -> float:
         """Get video duration in seconds"""
         try:

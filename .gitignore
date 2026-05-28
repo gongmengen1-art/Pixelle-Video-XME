@@ -48,6 +48,7 @@ config.yaml.bak
 
 # Logs
 *.log
+logs/
 
 # Test outputs
 test_outputs/
@@ -74,3 +75,7 @@ examples/
 repositories/
 
 *.out
+
+# Claude Code / AI tooling artifacts
+.agents/
+skills-lock.json

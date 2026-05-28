@@ -52,21 +52,22 @@ class AssetBasedPipelineUI(PipelineUI):
     def render(self, pixelle_video: Any):
         # Three-column layout
         left_col, middle_col, right_col = st.columns([1, 1, 1])
-        
+
         # ====================================================================
-        # Left Column: Asset Upload & Video Info
+        # Left Column: Asset Upload & Video Info & Subtitle Config
         # ====================================================================
         with left_col:
             asset_params = self._render_asset_input()
+            subtitle_params = self._render_subtitle_config()
             bgm_params = render_bgm_section(key_prefix="asset_")
             render_version_info()
-        
+
         # ====================================================================
         # Middle Column: Video Configuration
         # ====================================================================
         with middle_col:
             config_params = self._render_video_config(pixelle_video)
-        
+
         # ====================================================================
         # Right Column: Output Preview
         # ====================================================================
@@ -75,10 +76,11 @@ class AssetBasedPipelineUI(PipelineUI):
             video_params = {
                 "pipeline": self.name,
                 **asset_params,
+                **subtitle_params,
                 **bgm_params,
                 **config_params
             }
-            
+
             self._render_output_preview(pixelle_video, video_params)
     
     def _render_asset_input(self) -> dict:
@@ -133,31 +135,207 @@ class AssetBasedPipelineUI(PipelineUI):
             else:
                 st.info(tr("asset_based.assets.empty_hint"))
         
-        # Video title & intent
+        # Video title & script mode
         with st.container(border=True):
             st.markdown(f"**{tr('asset_based.section.video_info')}**")
-            
+
+            # Script mode toggle
+            script_mode = st.radio(
+                "script_mode",
+                options=["generate", "fixed"],
+                horizontal=True,
+                format_func=lambda x: tr(f"asset_based.script_mode.{x}"),
+                key="asset_script_mode",
+                label_visibility="collapsed",
+            )
+
             video_title = st.text_input(
                 tr("asset_based.video_title"),
                 placeholder=tr("asset_based.video_title_placeholder"),
                 help=tr("asset_based.video_title_help"),
-                key="asset_video_title"
+                key="asset_video_title",
             )
-            
-            intent = st.text_area(
-                tr("asset_based.intent"),
-                placeholder=tr("asset_based.intent_placeholder"),
-                help=tr("asset_based.intent_help"),
-                height=100,
-                key="asset_intent"
-            )
-        
+
+            if script_mode == "generate":
+                intent = st.text_area(
+                    tr("asset_based.intent"),
+                    placeholder=tr("asset_based.intent_placeholder"),
+                    help=tr("asset_based.intent_help"),
+                    height=100,
+                    key="asset_intent",
+                )
+                fixed_segments = None
+            else:
+                intent = None
+                fixed_segments = self._render_script_segments()
+
         return {
             "assets": asset_paths,
             "video_title": video_title,
-            "intent": intent if intent else None
+            "intent": intent if intent else None,
+            "script_mode": script_mode,
+            "fixed_segments": fixed_segments,
         }
     
+    def _render_script_segments(self) -> list:
+        """
+        Render '+' button segment list for custom script mode.
+        Returns list of dicts: [{"text": "...", "subtitle_style": "simple_white"}, ...]
+        """
+        SEG_KEY = "asset_script_segments"
+        DEFAULT_STYLE = "simple_white"
+
+        if SEG_KEY not in st.session_state:
+            st.session_state[SEG_KEY] = [{"text": "", "subtitle_style": DEFAULT_STYLE}]
+
+        segments: list = st.session_state[SEG_KEY]
+        n = len(segments)
+
+        # Initialise per-segment widget keys from stored list
+        for i, seg in enumerate(segments):
+            if f"asset_seg_{i}" not in st.session_state:
+                st.session_state[f"asset_seg_{i}"] = seg.get("text", "")
+            if f"asset_seg_style_{i}" not in st.session_state:
+                st.session_state[f"asset_seg_style_{i}"] = seg.get("subtitle_style", DEFAULT_STYLE)
+
+        from pixelle_video.utils.subtitle import SUBTITLE_STYLE_CSS
+        style_options = {
+            key: tr(f"asset_based.subtitle.style.{key}", fallback=key)
+            for key in SUBTITLE_STYLE_CSS
+        }
+
+        delete_idx = None
+        for i in range(n):
+            col_text, col_style, col_del = st.columns([5, 3, 1])
+            with col_text:
+                st.text_area(
+                    label=tr("asset_based.script.segment_label", n=i + 1),
+                    key=f"asset_seg_{i}",
+                    height=80,
+                    label_visibility="collapsed",
+                )
+            with col_style:
+                st.selectbox(
+                    label=f"style_{i}",
+                    options=list(style_options.keys()),
+                    format_func=lambda x, _o=style_options: _o[x],
+                    key=f"asset_seg_style_{i}",
+                    label_visibility="collapsed",
+                )
+            with col_del:
+                st.markdown("<div style='padding-top:28px'>", unsafe_allow_html=True)
+                if st.button(tr("asset_based.script.delete_segment"), key=f"del_seg_{i}", disabled=(n <= 1)):
+                    delete_idx = i
+                st.markdown("</div>", unsafe_allow_html=True)
+
+        # Handle delete
+        if delete_idx is not None:
+            new_segs = [
+                {"text": st.session_state.get(f"asset_seg_{j}", ""),
+                 "subtitle_style": st.session_state.get(f"asset_seg_style_{j}", DEFAULT_STYLE)}
+                for j in range(n)
+            ]
+            new_segs.pop(delete_idx)
+            for j in range(n):
+                st.session_state.pop(f"asset_seg_{j}", None)
+                st.session_state.pop(f"asset_seg_style_{j}", None)
+            st.session_state[SEG_KEY] = new_segs
+            st.rerun()
+
+        # Add segment button
+        if st.button(tr("asset_based.script.add_segment"), key="asset_add_seg"):
+            current = [
+                {"text": st.session_state.get(f"asset_seg_{j}", ""),
+                 "subtitle_style": st.session_state.get(f"asset_seg_style_{j}", DEFAULT_STYLE)}
+                for j in range(n)
+            ]
+            current.append({"text": "", "subtitle_style": DEFAULT_STYLE})
+            for j in range(n):
+                st.session_state.pop(f"asset_seg_{j}", None)
+                st.session_state.pop(f"asset_seg_style_{j}", None)
+            st.session_state[SEG_KEY] = current
+            st.rerun()
+
+        # Collect non-empty segments
+        result = [
+            {"text": st.session_state.get(f"asset_seg_{i}", "").strip(),
+             "subtitle_style": st.session_state.get(f"asset_seg_style_{i}", DEFAULT_STYLE)}
+            for i in range(n)
+            if st.session_state.get(f"asset_seg_{i}", "").strip()
+        ]
+        if not result:
+            st.caption(tr("asset_based.script.no_segments"))
+        return result
+
+    def _render_subtitle_config(self) -> dict:
+        """Render global subtitle configuration section."""
+        with st.container(border=True):
+            st.markdown(f"**{tr('asset_based.section.subtitle')}**")
+
+            # Row 1: style + position
+            col_style, col_pos = st.columns([3, 2])
+            with col_style:
+                from pixelle_video.utils.subtitle import SUBTITLE_STYLE_CSS
+                style_options = {
+                    key: tr(f"asset_based.subtitle.style.{key}", fallback=key)
+                    for key in SUBTITLE_STYLE_CSS
+                }
+                subtitle_style = st.selectbox(
+                    tr("asset_based.subtitle.style"),
+                    options=list(style_options.keys()),
+                    format_func=lambda x: style_options[x],
+                    key="asset_subtitle_style",
+                )
+            with col_pos:
+                position_options = {
+                    "top":    tr("asset_based.subtitle.position.top"),
+                    "middle": tr("asset_based.subtitle.position.middle"),
+                    "bottom": tr("asset_based.subtitle.position.bottom"),
+                }
+                subtitle_position = st.radio(
+                    tr("asset_based.subtitle.position"),
+                    options=list(position_options.keys()),
+                    format_func=lambda x: position_options[x],
+                    index=2,
+                    horizontal=True,
+                    key="asset_subtitle_position",
+                    label_visibility="collapsed",
+                )
+
+            # Row 2: lines + chars
+            col_lines, col_chars = st.columns([2, 3])
+            with col_lines:
+                lines_options = {
+                    1: tr("asset_based.subtitle.max_lines.1"),
+                    2: tr("asset_based.subtitle.max_lines.2"),
+                }
+                subtitle_max_lines = st.radio(
+                    tr("asset_based.subtitle.max_lines"),
+                    options=[1, 2],
+                    format_func=lambda x: lines_options[x],
+                    index=1,
+                    horizontal=True,
+                    key="asset_subtitle_max_lines",
+                    label_visibility="collapsed",
+                )
+            with col_chars:
+                subtitle_chars_per_line = st.slider(
+                    tr("asset_based.subtitle.chars_per_line"),
+                    min_value=10,
+                    max_value=30,
+                    value=18,
+                    step=1,
+                    key="asset_subtitle_chars",
+                )
+                st.caption(tr("asset_based.subtitle.chars_per_line_label", n=subtitle_chars_per_line))
+
+        return {
+            "subtitle_style": subtitle_style,
+            "subtitle_position": subtitle_position,
+            "subtitle_max_lines": subtitle_max_lines,
+            "subtitle_chars_per_line": subtitle_chars_per_line,
+        }
+
     def _render_video_config(self, pixelle_video: Any) -> dict:
         """Render video configuration section"""
         # Duration configuration
@@ -389,6 +567,14 @@ class AssetBasedPipelineUI(PipelineUI):
                         bgm_mode=video_params.get("bgm_mode", "loop"),
                         voice_id=video_params.get("voice_id", "zh-CN-YunjianNeural"),
                         tts_speed=video_params.get("tts_speed", 1.2),
+                        script_mode=video_params.get("script_mode", "generate"),
+                        fixed_script=video_params.get("fixed_script"),
+                        fixed_segments=video_params.get("fixed_segments"),
+                        split_mode=video_params.get("split_mode", "paragraph"),
+                        subtitle_style=video_params.get("subtitle_style", "simple_white"),
+                        subtitle_position=video_params.get("subtitle_position", "bottom"),
+                        subtitle_max_lines=video_params.get("subtitle_max_lines", 2),
+                        subtitle_chars_per_line=video_params.get("subtitle_chars_per_line", 18),
                         progress_callback=update_progress
                     ))
                     

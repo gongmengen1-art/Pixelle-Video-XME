@@ -298,16 +298,17 @@ class AssetBasedPipeline(LinearVideoPipeline):
     
     async def generate_content(self, context: PipelineContext) -> PipelineContext:
         """
-        Generate video script using LLM with structured output
-        
-        LLM directly assigns assets to scenes - no complex matching logic needed.
-        
-        Args:
-            context: Pipeline context
-        
-        Returns:
-            Updated context with generated script (scenes already have asset_path assigned)
+        Generate video script.
+
+        Supports two modes controlled by context.request["script_mode"]:
+        - "generate" (default): LLM creates the script from assets + intent
+        - "fixed": user-supplied script is split and distributed across assets
         """
+        script_mode = context.request.get("script_mode", "generate")
+        if script_mode == "fixed":
+            return await self._generate_content_from_fixed_script(context)
+
+        # ── AI generation (original logic) ──────────────────────────────────
         from pixelle_video.prompts.asset_script_generation import build_asset_script_prompt
         
         logger.info("🤖 Generating video script with LLM...")
@@ -466,6 +467,11 @@ class AssetBasedPipeline(LinearVideoPipeline):
             media_width = 1080
             media_height = 1920
         
+        # Build template_params: merge user-provided params with subtitle CSS vars
+        from pixelle_video.utils.subtitle import build_subtitle_template_vars
+        template_params: dict = dict(context.params.get("template_params") or {})
+        template_params.update(build_subtitle_template_vars(context.params))
+
         # Create StoryboardConfig
         context.config = StoryboardConfig(
             task_id=context.task_id,
@@ -479,7 +485,7 @@ class AssetBasedPipeline(LinearVideoPipeline):
             media_width=media_width,
             media_height=media_height,
             frame_template=template_name,
-            template_params=context.params.get("template_params")
+            template_params=template_params
         )
         
         # Create Storyboard
@@ -533,169 +539,169 @@ class AssetBasedPipeline(LinearVideoPipeline):
     
     async def produce_assets(self, context: PipelineContext) -> PipelineContext:
         """
-        Generate scene videos using FrameProcessor (asset + multiple narrations + template)
-        
-        Args:
-            context: Pipeline context
-        
-        Returns:
-            Updated context with processed frames
+        Generate scene videos with per-chunk subtitle sync.
+
+        For each scene:
+          Phase 1 — Generate TTS audio + subtitle PNG for every chunk of every narration.
+          Phase 2 — Build the scene video:
+            • Video asset: single ffmpeg call (scale → overlay subtitles at time ranges →
+              concat audio).  No clip-splitting, no concat = zero stutter at boundaries.
+            • Image asset: one sub-segment per chunk, then concat (static image, no issue).
         """
-        logger.info("🎬 Producing scene videos...")
-        
+        import shutil
+
+        from pixelle_video.services.frame_html import HTMLFrameGenerator
+        from pixelle_video.services.video import VideoService
+        from pixelle_video.utils.template_util import resolve_template_path
+        from pixelle_video.utils.subtitle import (
+            build_subtitle_template_vars,
+            format_subtitle_text,
+            split_narration_into_subtitle_chunks,
+        )
+
+        logger.info("🎬 Producing scene videos (per-narration sync mode)...")
+
         storyboard = context.storyboard
         config = context.config
         total_frames = len(storyboard.frames)
-        
-        # Progress range: 30% - 85% for frame production
+
+        all_narrations_count = sum(
+            len(f._scene_data.get("narrations", [f._scene_data.get("narration", "")]) or [])
+            for f in storyboard.frames
+        )
+        narration_counter = 0
+
         base_progress = 0.30
-        progress_range = 0.55  # 85% - 30%
-        
+        progress_range = 0.55
+
+        global_style = context.params.get("subtitle_style", "simple_white")
+
+        template_path = resolve_template_path(config.frame_template)
+        html_generator = HTMLFrameGenerator(template_path)
+        video_service = VideoService()
+
+        frames_dir = Path(context.task_dir) / "frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
         for i, frame in enumerate(storyboard.frames, 1):
             logger.info(f"Producing scene {i}/{total_frames}...")
-            
-            # Emit progress for this frame (each frame has 4 steps: audio, combine, duration, compose)
-            frame_progress = base_progress + (i - 1) / total_frames * progress_range
-            self._emit_progress(ProgressEvent(
-                event_type="frame_step",
-                progress=frame_progress,
-                frame_current=i,
-                frame_total=total_frames,
-                step=1,
-                action="audio"
-            ))
-            
-            # Get scene data with narrations
+
             scene = frame._scene_data
             narrations = scene.get("narrations", [scene.get("narration", "")])
             if isinstance(narrations, str):
                 narrations = [narrations]
-            
-            logger.info(f"Scene {i} has {len(narrations)} narration(s)")
-            
-            # Step 1: Generate audio for each narration and combine
-            narration_audios = []
+            narration_styles: list = scene.get("narration_styles", [])
+
+            # ── Phase 1: TTS + subtitle PNG for every chunk ───────────────────
+            # chunks_info: [{audio, composed, duration, t_start, text}]
+            chunks_info: list = []
+            video_offset = 0.0
+
             for j, narration_text in enumerate(narrations, 1):
-                audio_path = Path(context.task_dir) / "frames" / f"{i:02d}_narration_{j}.mp3"
-                audio_path.parent.mkdir(parents=True, exist_ok=True)
-                
-                await self.core.tts(
-                    text=narration_text,
-                    output_path=str(audio_path),
-                    voice=config.voice_id,
-                    speed=config.tts_speed
+                narration_counter += 1
+                progress = base_progress + narration_counter / max(all_narrations_count, 1) * progress_range
+
+                narration_style = (
+                    narration_styles[j - 1] if j - 1 < len(narration_styles) else global_style
                 )
-                
-                narration_audios.append(str(audio_path))
-                logger.debug(f"  Narration {j}/{len(narrations)}: {narration_text[:30]}...")
-            
-            # Concatenate all narration audios for this scene
-            if len(narration_audios) > 1:
-                from pixelle_video.utils.os_util import get_task_frame_path
-                
-                # Emit progress for combining audio
-                frame_progress = base_progress + ((i - 1) + 0.25) / total_frames * progress_range
-                self._emit_progress(ProgressEvent(
-                    event_type="frame_step",
-                    progress=frame_progress,
-                    frame_current=i,
-                    frame_total=total_frames,
-                    step=2,
-                    action="audio"
-                ))
-                
-                combined_audio_path = Path(context.task_dir) / "frames" / f"{i:02d}_audio.mp3"
-                
-                # Use FFmpeg to concatenate audio files
-                import subprocess
-                
-                # Create a file list for FFmpeg concat
-                filelist_path = Path(context.task_dir) / "frames" / f"{i:02d}_audiolist.txt"
-                with open(filelist_path, 'w') as f:
-                    for audio_file in narration_audios:
-                        escaped_path = str(Path(audio_file).absolute()).replace("'", "'\\''")
-                        f.write(f"file '{escaped_path}'\n")
-                
-                # Concatenate audio files
-                concat_cmd = [
-                    'ffmpeg',
-                    '-f', 'concat',
-                    '-safe', '0',
-                    '-i', str(filelist_path),
-                    '-c', 'copy',
-                    '-y',
-                    str(combined_audio_path)
-                ]
-                
-                subprocess.run(concat_cmd, check=True, capture_output=True)
-                frame.audio_path = str(combined_audio_path)
-                
-                logger.info(f"✅ Combined {len(narration_audios)} narrations into one audio")
+                sub_vars = build_subtitle_template_vars({
+                    **context.params,
+                    "subtitle_style": narration_style,
+                })
+                max_lines = int(sub_vars["_subtitle_max_lines"])
+                chars_per_line = int(sub_vars["_subtitle_chars_per_line"])
+
+                chunks = split_narration_into_subtitle_chunks(narration_text, max_lines, chars_per_line)
+                logger.debug(f"  Scene {i} narration {j}: {len(chunks)} chunk(s)")
+
+                for c, chunk_text in enumerate(chunks, 1):
+                    self._emit_progress(ProgressEvent(
+                        event_type="frame_step", progress=progress,
+                        frame_current=i, frame_total=total_frames, step=j, action="audio",
+                    ))
+
+                    # 1. TTS
+                    audio_path = str(frames_dir / f"{i:02d}_n{j}_c{c}.mp3")
+                    await self.core.tts(
+                        text=chunk_text, output_path=audio_path,
+                        voice=config.voice_id, speed=config.tts_speed,
+                    )
+
+                    # 2. Get audio duration
+                    import ffmpeg as _ffmpeg
+                    try:
+                        chunk_dur = float(_ffmpeg.probe(audio_path)['format']['duration'])
+                    except Exception:
+                        chunk_dur = 5.0
+
+                    # 3. Render subtitle PNG
+                    self._emit_progress(ProgressEvent(
+                        event_type="frame_step", progress=min(progress + 0.01, 0.99),
+                        frame_current=i, frame_total=total_frames, step=j, action="compose",
+                    ))
+                    composed_path = str(frames_dir / f"{i:02d}_n{j}_c{c}_composed.png")
+                    ext: dict = {"index": frame.index + 1}
+                    if config.template_params:
+                        ext.update(config.template_params)
+                    ext.update(sub_vars)
+                    media_path = frame.video_path if frame.media_type == "video" else frame.image_path
+                    await html_generator.generate_frame(
+                        title=storyboard.title, text=format_subtitle_text(chunk_text, max_lines, chars_per_line),
+                        image=media_path, ext=ext, output_path=composed_path,
+                    )
+
+                    chunks_info.append({
+                        "audio": audio_path,
+                        "composed": composed_path,
+                        "duration": chunk_dur,
+                        "t_start": video_offset,
+                        "text": chunk_text,
+                    })
+                    video_offset += chunk_dur
+                    logger.debug(
+                        f"  Scene {i} n{j}/c{c}: {chunk_text[:30]}{'…' if len(chunk_text) > 30 else ''}"
+                    )
+
+            # ── Phase 2: Build scene video ────────────────────────────────────
+            self._emit_progress(ProgressEvent(
+                event_type="frame_step", progress=min(progress + 0.02, 0.99),
+                frame_current=i, frame_total=total_frames, step=len(narrations), action="video",
+            ))
+
+            final_segment = str(frames_dir / f"{i:02d}_segment.mp4")
+
+            if frame.media_type == "video":
+                # Single ffmpeg call: scale + time-ranged subtitle overlays + audio concat.
+                # No intermediate clip files, no segment concat → no frame-boundary stutter.
+                self._build_video_scene(
+                    source=frame.video_path,
+                    chunks=chunks_info,
+                    output=final_segment,
+                )
             else:
-                frame.audio_path = narration_audios[0]
-            
-            # Step 2: Use FrameProcessor to generate composed frame and video
-            # FrameProcessor will handle:
-            # - Template rendering (with proper dimensions)
-            # - Subtitle composition
-            # - Video segment creation
-            # - Proper file naming in frames/
-            
-            # Since we already have the audio and image, we bypass some steps
-            # by manually calling the composition steps
-            
-            # Emit progress for duration calculation
-            frame_progress = base_progress + ((i - 1) + 0.5) / total_frames * progress_range
-            self._emit_progress(ProgressEvent(
-                event_type="frame_step",
-                progress=frame_progress,
-                frame_current=i,
-                frame_total=total_frames,
-                step=3,
-                action="compose"
-            ))
-            
-            # Get audio duration for frame duration
-            import subprocess
-            duration_cmd = [
-                'ffprobe',
-                '-v', 'error',
-                '-show_entries', 'format=duration',
-                '-of', 'default=noprint_wrappers=1:nokey=1',
-                frame.audio_path
-            ]
-            duration_result = subprocess.run(duration_cmd, capture_output=True, text=True, check=True)
-            frame.duration = float(duration_result.stdout.strip())
-            
-            # Emit progress for video composition
-            frame_progress = base_progress + ((i - 1) + 0.75) / total_frames * progress_range
-            self._emit_progress(ProgressEvent(
-                event_type="frame_step",
-                progress=frame_progress,
-                frame_current=i,
-                frame_total=total_frames,
-                step=4,
-                action="video"
-            ))
-            
-            # Use FrameProcessor for proper composition
-            processed_frame = await self.core.frame_processor(
-                frame=frame,
-                storyboard=storyboard,
-                config=config,
-                total_frames=total_frames
-            )
-            
-            logger.success(f"✅ Scene {i} complete")
-        
-        # Emit completion of frame production
+                # Image asset: create one sub-segment per chunk, then concat.
+                sub_paths = []
+                for k, info in enumerate(chunks_info, 1):
+                    sp = str(frames_dir / f"{i:02d}_sub_{k}.mp4")
+                    video_service.create_video_from_image(
+                        image=info["composed"], audio=info["audio"],
+                        output=sp, fps=config.video_fps,
+                    )
+                    sub_paths.append(sp)
+
+                if len(sub_paths) == 1:
+                    shutil.copy(sub_paths[0], final_segment)
+                else:
+                    self._concat_segments(sub_paths, final_segment)
+
+            frame.video_segment_path = final_segment
+            logger.success(f"✅ Scene {i} complete ({len(chunks_info)} subtitle chunk(s))")
+
         self._emit_progress(ProgressEvent(
-            event_type="processing_frame",
-            progress=0.85,
-            frame_current=total_frames,
-            frame_total=total_frames
+            event_type="processing_frame", progress=0.85,
+            frame_current=total_frames, frame_total=total_frames,
         ))
-        
+
         return context
     
     async def post_production(self, context: PipelineContext) -> PipelineContext:
@@ -735,7 +741,7 @@ class AssetBasedPipeline(LinearVideoPipeline):
         if bgm_path:
             logger.info(f"🎵 Adding BGM: {bgm_path} (volume={bgm_volume}, mode={bgm_mode})")
         
-        self.core.video.concat_videos(
+        self.core.video.concat_videos_with_transition(
             videos=scene_videos,
             output=str(final_video_path),
             bgm_path=bgm_path,
@@ -848,19 +854,178 @@ class AssetBasedPipeline(LinearVideoPipeline):
             logger.error(f"Failed to persist task data: {e}")
             # Don't raise - persistence failure shouldn't break video generation
     
+    async def _generate_content_from_fixed_script(
+        self, context: PipelineContext
+    ) -> PipelineContext:
+        """
+        Build context.script from a user-provided fixed script.
+
+        Accepts either:
+        - fixed_segments: List[str] — explicit segment list from the "+" UI
+        - fixed_script + split_mode: raw text that is split automatically (legacy)
+
+        Distributes narration segments sequentially and evenly across assets.
+        Assets that receive no segments (when segments < assets) are skipped.
+        """
+        self._emit_progress(ProgressEvent(event_type="generating_script", progress=0.16))
+
+        # Prefer explicit segment list from the "+" button UI
+        fixed_segments = context.request.get("fixed_segments")
+        narration_styles_flat: list = []
+        if fixed_segments:
+            if fixed_segments and isinstance(fixed_segments[0], dict):
+                # New format: [{"text": "...", "subtitle_style": "card"}, ...]
+                narrations = [s["text"].strip() for s in fixed_segments if s.get("text", "").strip()]
+                narration_styles_flat = [
+                    s.get("subtitle_style", "simple_white")
+                    for s in fixed_segments if s.get("text", "").strip()
+                ]
+            else:
+                # Legacy: plain list of strings
+                narrations = [s.strip() for s in fixed_segments if s and s.strip()]
+        else:
+            # Legacy path: split raw text
+            from pixelle_video.utils.content_generators import split_narration_script
+            fixed_script = context.request.get("fixed_script", "")
+            split_mode = context.request.get("split_mode", "paragraph")
+            if not fixed_script or not fixed_script.strip():
+                raise ValueError("固定文案不能为空，请填写视频文案内容。")
+            narrations = await split_narration_script(fixed_script, split_mode=split_mode)
+
+        if not narrations:
+            raise ValueError("文案段落为空，请至少添加一段文案内容。")
+
+        # 2. Distribute segments across assets (sequential equal-size bucketing)
+        assets = list(self.asset_index.keys())
+        n, m = len(narrations), len(assets)
+
+        scenes = []
+        for asset_idx, asset_path in enumerate(assets):
+            start = asset_idx * n // m
+            end = (asset_idx + 1) * n // m
+            bucket = narrations[start:end]
+            if not bucket:
+                continue  # fewer segments than assets — skip this asset
+
+            bucket_styles = narration_styles_flat[start:end] if narration_styles_flat else []
+            scenes.append({
+                "scene_number": len(scenes) + 1,
+                "asset_path": asset_path,
+                "narrations": bucket,
+                "narration_styles": bucket_styles,
+                "duration": len(bucket) * 5,  # rough estimate only
+            })
+
+        context.script = scenes
+
+        self._emit_progress(
+            ProgressEvent(
+                event_type="generating_script",
+                progress=0.25,
+                extra_info="complete",
+            )
+        )
+        logger.success(
+            f"✅ Fixed script: {n} segments → {len(scenes)} scenes across {m} assets"
+        )
+        return context
+
     # Helper methods
-    
+
     def _get_asset_type(self, path: Path) -> str:
         """Determine asset type from file extension"""
         image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
         video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
-        
+
         ext = path.suffix.lower()
-        
+
         if ext in image_exts:
             return "image"
         elif ext in video_exts:
             return "video"
         else:
             return "unknown"
-    
+
+    def _concat_segments(self, videos: list, output: str) -> None:
+        """Concatenate sub-segments within a scene using ffmpeg concat filter (no transition)."""
+        import subprocess
+        n = len(videos)
+        cmd = ["ffmpeg"]
+        for v in videos:
+            cmd.extend(["-i", v])
+        filter_str = "".join(f"[{i}:v][{i}:a]" for i in range(n))
+        filter_str += f"concat=n={n}:v=1:a=1[v][a]"
+        cmd.extend([
+            "-filter_complex", filter_str,
+            "-map", "[v]", "-map", "[a]",
+            "-vcodec", "libx264", "-acodec", "aac",
+            "-pix_fmt", "yuv420p", "-crf", "23", "-preset", "medium",
+            "-y", output,
+        ])
+        subprocess.run(cmd, check=True, capture_output=True)
+        logger.debug(f"_concat_segments: {n} segments → {output}")
+
+    def _build_video_scene(self, source: str, chunks: list, output: str) -> None:
+        """
+        Build a scene video for a VIDEO asset in a single ffmpeg call.
+
+        The source video is scaled to 1080×1920 (contain / letterbox), then each
+        subtitle PNG is overlaid only during its time window, and all TTS audio
+        tracks are concatenated.  Because there is no clip-extraction or segment
+        concat, playback is completely continuous — zero stutter at chunk boundaries.
+
+        chunks: list of dicts with keys: audio, composed, duration, t_start
+        """
+        import subprocess
+        n = len(chunks)
+        total_dur = sum(c["duration"] for c in chunks)
+        W, H = 1080, 1920
+
+        cmd = ["ffmpeg", "-y"]
+        # [0] source video — full file, no pre-trimming
+        cmd += ["-i", source]
+        # [1 … n] subtitle PNGs, looped so the overlay filter can hold them
+        # for their entire time window
+        for c in chunks:
+            cmd += ["-loop", "1", "-i", c["composed"]]
+        # [n+1 … 2n] TTS audio clips
+        for c in chunks:
+            cmd += ["-i", c["audio"]]
+
+        # ── filter_complex ──────────────────────────────────────────────────
+        parts = []
+
+        # Scale source video to template size (contain = letterbox black bars)
+        parts.append(
+            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
+            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black[scaled]"
+        )
+
+        # Chain subtitle overlays; each is visible only during its time window
+        vref = "[scaled]"
+        for idx, c in enumerate(chunks):
+            t0, t1 = c["t_start"], c["t_start"] + c["duration"]
+            vout = f"[v{idx}]"
+            parts.append(
+                f"{vref}[{idx + 1}:v]overlay=enable='between(t,{t0:.4f},{t1:.4f})'{vout}"
+            )
+            vref = vout
+
+        # Trim video to exact scene duration (prevents trailing source footage)
+        parts.append(f"{vref}trim=duration={total_dur:.4f},setpts=PTS-STARTPTS[vout]")
+
+        # Concatenate TTS audio tracks
+        audio_inputs = "".join(f"[{n + 1 + idx}:a]" for idx in range(n))
+        parts.append(f"{audio_inputs}concat=n={n}:v=0:a=1[aout]")
+
+        cmd += ["-filter_complex", "; ".join(parts)]
+        cmd += ["-map", "[vout]", "-map", "[aout]"]
+        cmd += [
+            "-c:v", "libx264", "-c:a", "aac",
+            "-pix_fmt", "yuv420p", "-crf", "23", "-preset", "medium",
+            output,
+        ]
+
+        subprocess.run(cmd, check=True, capture_output=True)
+        logger.debug(f"_build_video_scene: {n} chunks, {total_dur:.2f}s → {output}")
+

@@ -32,6 +32,7 @@ Just input a **topic**, and Pixelle-Video will automatically:
 
 ## 📋 Recent Updates
 
+- ✅ **2026-05-28**: Major upgrade to Custom Media mode: precise subtitle-audio sync engine, multi-segment "+" script input, per-segment subtitle style/position config; fixed video-asset stutter at splice points
 - ✅ **2026-01-26**: Added the Motion Transfer pipeline — upload a reference video and an image to transfer motion.
 - ✅ **2026-01-14**: Added "Digital Human" and "Image-to-Video" pipelines, multi-language TTS voices support
 - ✅ **2026-01-06**: Added RunningHub 48G VRAM machine support
@@ -57,6 +58,9 @@ Just input a **topic**, and Pixelle-Video will automatically:
 - ✅ **Flexible Dimensions** - Support portrait, landscape and other video dimensions
 - ✅ **Multiple AI Models** - Support GPT, Qwen, DeepSeek, Ollama and more
 - ✅ **Flexible Atomic Capability Combination** - Based on ComfyUI architecture, can use preset workflows or customize any capability (such as replacing image generation model with FLUX, replacing TTS with ChatTTS, etc.)
+- ✅ **Precise Subtitle-Audio Sync** - In Custom Media mode, each narration segment gets its own TTS + subtitle render; long text is auto-split at punctuation so subtitles align word-for-word with the voiceover
+- ✅ **Multi-segment Script Editor** - Custom mode supports "+" to add unlimited narration segments, each with an independent subtitle style (Simple White, HK Yellow-Red, Outlined, Semi-BG, Card, etc.)
+- ✅ **Subtitle Style & Position** - Configurable position (top / middle / bottom), chars-per-line, max lines; styles injected via CSS presets — add new styles without touching the HTML template
 
 
 ## 📊 Video Generation Pipeline
