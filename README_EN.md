@@ -32,6 +32,7 @@ Just input a **topic**, and Pixelle-Video will automatically:
 
 ## 📋 Recent Updates
 
+- ✅ **2026-05-29**: Custom Media mode adds cover-image upload (groundwork for one-click publishing to Douyin / Xiaohongshu); fixed "picture freezes when narration is longer than the video asset" — short assets are auto-looped with a 0.5s crossfade at the loop seam
 - ✅ **2026-05-28**: Major upgrade to Custom Media mode: precise subtitle-audio sync engine, multi-segment "+" script input, per-segment subtitle style/position config; fixed video-asset stutter at splice points
 - ✅ **2026-01-26**: Added the Motion Transfer pipeline — upload a reference video and an image to transfer motion.
 - ✅ **2026-01-14**: Added "Digital Human" and "Image-to-Video" pipelines, multi-language TTS voices support
@@ -61,6 +62,8 @@ Just input a **topic**, and Pixelle-Video will automatically:
 - ✅ **Precise Subtitle-Audio Sync** - In Custom Media mode, each narration segment gets its own TTS + subtitle render; long text is auto-split at punctuation so subtitles align word-for-word with the voiceover
 - ✅ **Multi-segment Script Editor** - Custom mode supports "+" to add unlimited narration segments, each with an independent subtitle style (Simple White, HK Yellow-Red, Outlined, Semi-BG, Card, etc.)
 - ✅ **Subtitle Style & Position** - Configurable position (top / middle / bottom), chars-per-line, max lines; styles injected via CSS presets — add new styles without touching the HTML template
+- ✅ **Custom Cover Upload** - In Custom Media mode, upload a cover image; saved alongside the video (`{task_id}_cover.{ext}`) and recorded in `metadata.json` — ready as the integration point for one-click publishing to Douyin, Xiaohongshu, etc.
+- ✅ **Smart Video Looping** - When the narration is longer than the video asset, the source is automatically looped with a 0.5s crossfade at the loop seam — picture never freezes; when the video is longer than the narration, it is trimmed to fit
 
 
 ## 📊 Video Generation Pipeline

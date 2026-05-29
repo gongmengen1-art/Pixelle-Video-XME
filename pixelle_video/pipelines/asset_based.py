@@ -775,17 +775,36 @@ class AssetBasedPipeline(LinearVideoPipeline):
         """
         logger.success(f"🎉 Asset-based video generation complete!")
         logger.info(f"Video: {context.final_video_path}")
-        
+
+        # Handle cover image (copy to task output dir)
+        await self._handle_cover(context)
+
         # Emit completion
         self._emit_progress(ProgressEvent(
             event_type="completed",
             progress=1.0
         ))
-        
+
         # Persist metadata for history tracking
         await self._persist_task_data(context)
-        
+
         return context
+
+    async def _handle_cover(self, context: PipelineContext) -> None:
+        """Copy user-uploaded cover to the task output directory."""
+        import shutil
+        source = context.request.get("cover_image_path")
+        if not source:
+            return
+        source_path = Path(source)
+        if not source_path.exists():
+            logger.warning(f"Cover image not found: {source}")
+            return
+        ext = source_path.suffix or ".jpg"
+        dest = context.task_dir / f"{context.task_id}_cover{ext}"
+        shutil.copy2(source_path, dest)
+        context.cover_path = str(dest)
+        logger.info(f"🖼️ Cover saved: {dest}")
     
     async def _persist_task_data(self, ctx: PipelineContext):
         """
@@ -829,6 +848,7 @@ class AssetBasedPipeline(LinearVideoPipeline):
                 
                 "result": {
                     "video_path": ctx.final_video_path,
+                    "cover_path": getattr(ctx, "cover_path", None),
                     "duration": storyboard.total_duration if storyboard else 0,
                     "file_size": file_size,
                     "n_frames": len(storyboard.frames) if storyboard else 0
@@ -974,12 +994,36 @@ class AssetBasedPipeline(LinearVideoPipeline):
         tracks are concatenated.  Because there is no clip-extraction or segment
         concat, playback is completely continuous — zero stutter at chunk boundaries.
 
+        If the source video is SHORTER than the narration audio total, the source
+        is looped (replicated via split) and the loop boundary is smoothed with a
+        0.5s xfade dissolve, so the picture never freezes on the last frame.
+
         chunks: list of dicts with keys: audio, composed, duration, t_start
         """
+        import math
         import subprocess
+        import ffmpeg as _ffmpeg
+
         n = len(chunks)
         total_dur = sum(c["duration"] for c in chunks)
         W, H = 1080, 1920
+        XFADE_DUR = 0.5  # seconds of crossfade at each loop boundary
+
+        # Probe source duration to decide whether we need to loop the source
+        try:
+            src_dur = float(_ffmpeg.probe(source)["format"]["duration"])
+        except Exception:
+            logger.warning(f"Failed to probe duration for {source}; assuming no loop needed")
+            src_dur = total_dur + 1.0
+
+        # How many copies of the source do we need?
+        #   total covered = n_copies * src_dur - (n_copies - 1) * XFADE_DUR
+        #   require: covered >= total_dur
+        #   => n_copies >= (total_dur - XFADE_DUR) / (src_dur - XFADE_DUR)
+        if total_dur <= src_dur or src_dur <= XFADE_DUR * 2:
+            n_copies = 1
+        else:
+            n_copies = max(2, math.ceil((total_dur - XFADE_DUR) / (src_dur - XFADE_DUR)))
 
         cmd = ["ffmpeg", "-y"]
         # [0] source video — full file, no pre-trimming
@@ -996,10 +1040,30 @@ class AssetBasedPipeline(LinearVideoPipeline):
         parts = []
 
         # Scale source video to template size (contain = letterbox black bars)
-        parts.append(
-            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
-            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black[scaled]"
+        scale_pad = (
+            f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black"
         )
+
+        if n_copies == 1:
+            # Source is long enough — no loop, single pass
+            parts.append(f"[0:v]{scale_pad}[scaled]")
+        else:
+            # Replicate the scaled source N times, then crossfade the seams
+            parts.append(
+                f"[0:v]{scale_pad},split={n_copies}"
+                + "".join(f"[s{i}]" for i in range(n_copies))
+            )
+            current = "[s0]"
+            for i in range(1, n_copies):
+                is_last = i == n_copies - 1
+                next_label = "[scaled]" if is_last else f"[xf{i}]"
+                offset = i * (src_dur - XFADE_DUR)
+                parts.append(
+                    f"{current}[s{i}]xfade=transition=fade:"
+                    f"duration={XFADE_DUR}:offset={offset:.4f}{next_label}"
+                )
+                current = next_label
 
         # Chain subtitle overlays; each is visible only during its time window
         vref = "[scaled]"
@@ -1027,5 +1091,8 @@ class AssetBasedPipeline(LinearVideoPipeline):
         ]
 
         subprocess.run(cmd, check=True, capture_output=True)
-        logger.debug(f"_build_video_scene: {n} chunks, {total_dur:.2f}s → {output}")
+        logger.debug(
+            f"_build_video_scene: {n} chunks, narration={total_dur:.2f}s, "
+            f"src={src_dur:.2f}s, loops={n_copies} → {output}"
+        )
 

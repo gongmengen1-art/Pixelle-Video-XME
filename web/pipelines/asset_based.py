@@ -59,6 +59,7 @@ class AssetBasedPipelineUI(PipelineUI):
         with left_col:
             asset_params = self._render_asset_input()
             subtitle_params = self._render_subtitle_config()
+            cover_params = self._render_cover_config()
             bgm_params = render_bgm_section(key_prefix="asset_")
             render_version_info()
 
@@ -77,6 +78,7 @@ class AssetBasedPipelineUI(PipelineUI):
                 "pipeline": self.name,
                 **asset_params,
                 **subtitle_params,
+                **cover_params,
                 **bgm_params,
                 **config_params
             }
@@ -266,6 +268,37 @@ class AssetBasedPipelineUI(PipelineUI):
         if not result:
             st.caption(tr("asset_based.script.no_segments"))
         return result
+
+    def _render_cover_config(self) -> dict:
+        """Render cover image upload section."""
+        with st.container(border=True):
+            st.markdown(f"**{tr('asset_based.section.cover')}**")
+
+            uploaded_cover = st.file_uploader(
+                tr("asset_based.cover.upload"),
+                type=["jpg", "jpeg", "png", "webp"],
+                accept_multiple_files=False,
+                help=tr("asset_based.cover.upload_help"),
+                key="asset_cover_file",
+            )
+
+            cover_image_path = None
+            if uploaded_cover is not None:
+                import uuid
+                from pathlib import Path as _Path
+                session_id = str(uuid.uuid4()).replace("-", "")[:12]
+                temp_dir = _Path(f"temp/cover_{session_id}")
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                cover_path = temp_dir / uploaded_cover.name
+                with open(cover_path, "wb") as f:
+                    f.write(uploaded_cover.getbuffer())
+                cover_image_path = str(cover_path.absolute())
+                st.success(tr("asset_based.cover.uploaded", name=uploaded_cover.name))
+                st.image(uploaded_cover, use_container_width=True)
+            else:
+                st.caption(tr("asset_based.cover.empty_hint"))
+
+        return {"cover_image_path": cover_image_path}
 
     def _render_subtitle_config(self) -> dict:
         """Render global subtitle configuration section."""
@@ -575,6 +608,7 @@ class AssetBasedPipelineUI(PipelineUI):
                         subtitle_position=video_params.get("subtitle_position", "bottom"),
                         subtitle_max_lines=video_params.get("subtitle_max_lines", 2),
                         subtitle_chars_per_line=video_params.get("subtitle_chars_per_line", 18),
+                        cover_image_path=video_params.get("cover_image_path"),
                         progress_callback=update_progress
                     ))
                     
@@ -616,6 +650,23 @@ class AssetBasedPipelineUI(PipelineUI):
                                 mime="video/mp4",
                                 use_container_width=True
                             )
+
+                        # Cover preview + download (if cover was generated)
+                        cover_path = getattr(ctx, "cover_path", None)
+                        if cover_path and os.path.exists(cover_path):
+                            st.markdown("---")
+                            st.image(cover_path, caption=tr("asset_based.section.cover"), use_container_width=True)
+                            with open(cover_path, "rb") as cover_file:
+                                cover_ext = os.path.splitext(cover_path)[1] or ".jpg"
+                                cover_filename = os.path.basename(cover_path)
+                                st.download_button(
+                                    label=tr("asset_based.cover.download"),
+                                    data=cover_file.read(),
+                                    file_name=cover_filename,
+                                    mime=f"image/{cover_ext.lstrip('.').replace('jpg', 'jpeg')}",
+                                    use_container_width=True,
+                                    key="download_cover"
+                                )
                     else:
                         st.error(tr("status.video_not_found", path=ctx.final_video_path))
                 

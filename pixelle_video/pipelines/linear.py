@@ -60,6 +60,7 @@ class PipelineContext:
     
     # === Output ===
     final_video_path: Optional[str] = None
+    cover_path: Optional[str] = None
     result: Optional[VideoGenerationResult] = None
 
 
