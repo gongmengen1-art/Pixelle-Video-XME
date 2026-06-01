@@ -315,14 +315,30 @@ class VideoService:
         n = len(videos)
         filter_parts = []
 
+        # Normalize every video stream before xfade.
+        # ffmpeg 8.x strictly requires both xfade input links to share the same
+        # timebase; clips encoded from VFR assets carry slightly different
+        # fps/tbn, which makes xfade abort with "input link timebases do not
+        # match" (-22 Invalid argument). Forcing a constant fps + timebase + SAR
+        # here makes the transition robust across ffmpeg versions.
+        norm_fps = 30
+        norm_labels = []
+        for i in range(n):
+            norm_label = f"[v{i}n]"
+            filter_parts.append(
+                f"[{i}:v]fps={norm_fps},settb=AVTB,setsar=1,"
+                f"setpts=PTS-STARTPTS{norm_label}"
+            )
+            norm_labels.append(norm_label)
+
         # Video xfade chain: cumulative offset accounts for previous overlaps
-        v_in = "[0:v]"
+        v_in = norm_labels[0]
         cumulative_offset = 0.0
         for i in range(1, n):
             cumulative_offset += durations[i - 1] - t
             v_out = "[v]" if i == n - 1 else f"[vx{i}]"
             filter_parts.append(
-                f"{v_in}[{i}:v]xfade="
+                f"{v_in}{norm_labels[i]}xfade="
                 f"transition={transition}:"
                 f"duration={t:.3f}:"
                 f"offset={cumulative_offset:.3f}"
@@ -330,12 +346,25 @@ class VideoService:
             )
             v_in = v_out
 
+        # Normalize every audio stream before acrossfade, for the same
+        # version-sensitivity reason as the video chain above: align sample
+        # rate, channel layout and timebase so acrossfade never aborts on
+        # mismatched input links.
+        norm_a_labels = []
+        for i in range(n):
+            norm_a_label = f"[a{i}n]"
+            filter_parts.append(
+                f"[{i}:a]aresample=44100,aformat=channel_layouts=stereo,"
+                f"asetpts=PTS-STARTPTS{norm_a_label}"
+            )
+            norm_a_labels.append(norm_a_label)
+
         # Audio acrossfade chain
-        a_in = "[0:a]"
+        a_in = norm_a_labels[0]
         for i in range(1, n):
             a_out = "[a]" if i == n - 1 else f"[ax{i}]"
             filter_parts.append(
-                f"{a_in}[{i}:a]acrossfade=d={t:.3f}{a_out}"
+                f"{a_in}{norm_a_labels[i]}acrossfade=d={t:.3f}{a_out}"
             )
             a_in = a_out
 
