@@ -651,6 +651,22 @@ class AssetBasedPipelineUI(PipelineUI):
                                 use_container_width=True
                             )
 
+                        # Quick entry to the Publish tab (semi-auto publish).
+                        # st.tabs can't be switched programmatically, so we stash
+                        # the video path in session_state and ask the user to
+                        # click the Publish tab (which pre-fills from it).
+                        if st.button(
+                            tr("asset_based.go_publish", fallback="📤 去发布到抖音/小红书"),
+                            use_container_width=True,
+                            key="asset_go_publish",
+                        ):
+                            st.session_state["publish_video_path"] = ctx.final_video_path
+                            st.session_state["publish_title"] = video_params.get("video_title", "")
+                            st.toast(tr(
+                                "asset_based.go_publish_hint",
+                                fallback="已暂存视频，请点击上方【📤 一键发布】标签页继续",
+                            ))
+
                         # Cover preview + download (if cover was generated)
                         cover_path = getattr(ctx, "cover_path", None)
                         if cover_path and os.path.exists(cover_path):

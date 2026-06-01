@@ -79,3 +79,6 @@ repositories/
 # Claude Code / AI tooling artifacts
 .agents/
 skills-lock.json
+
+# Publish login state (cookies / storage_state — sensitive, never commit)
+data/publish_sessions/

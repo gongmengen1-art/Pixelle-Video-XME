@@ -15,7 +15,8 @@ Configuration schema with Pydantic models
 
 Single source of truth for all configuration defaults and validation.
 """
-from typing import Optional
+from typing import List, Optional
+
 from pydantic import BaseModel, Field
 
 
@@ -88,12 +89,29 @@ class TemplateConfig(BaseModel):
     )
 
 
+class PublishAccountState(BaseModel):
+    """Saved login state for one platform account"""
+    platform: str = Field(..., description="Platform key: 'douyin' | 'xiaohongshu'")
+    account_label: str = Field(default="default", description="Account label (supports multiple accounts per platform)")
+    session_file: Optional[str] = Field(default=None, description="Path to Playwright storage_state JSON")
+    last_login_at: Optional[str] = Field(default=None, description="ISO timestamp of last successful login")
+
+
+class PublishConfig(BaseModel):
+    """One-click publishing configuration (Douyin / Xiaohongshu)"""
+    enabled: bool = Field(default=False, description="Enable the publishing feature")
+    sessions_dir: str = Field(default="data/publish_sessions", description="Directory storing per-account login state files")
+    headless: bool = Field(default=False, description="Run browser headless (must be False for local semi-auto QR login)")
+    accounts: List[PublishAccountState] = Field(default_factory=list, description="Saved account login states")
+
+
 class PixelleVideoConfig(BaseModel):
     """Pixelle-Video main configuration"""
     project_name: str = Field(default="Pixelle-Video", description="Project name")
     llm: LLMConfig = Field(default_factory=LLMConfig)
     comfyui: ComfyUIConfig = Field(default_factory=ComfyUIConfig)
     template: TemplateConfig = Field(default_factory=TemplateConfig)
+    publish: PublishConfig = Field(default_factory=PublishConfig)
     
     def is_llm_configured(self) -> bool:
         """Check if LLM is properly configured"""

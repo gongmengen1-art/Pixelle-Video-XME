@@ -33,6 +33,7 @@ from pixelle_video.services.video import VideoService
 from pixelle_video.services.frame_processor import FrameProcessor
 from pixelle_video.services.persistence import PersistenceService
 from pixelle_video.services.history_manager import HistoryManager
+from pixelle_video.services.publisher import PublisherService
 from pixelle_video.pipelines.standard import StandardPipeline
 from pixelle_video.pipelines.custom import CustomPipeline
 from pixelle_video.pipelines.asset_based import AssetBasedPipeline
@@ -94,6 +95,7 @@ class PixelleVideoCore:
         self.frame_processor: Optional[FrameProcessor] = None
         self.persistence: Optional[PersistenceService] = None
         self.history: Optional[HistoryManager] = None
+        self.publisher: Optional[PublisherService] = None
         
         # Video generation pipelines (dictionary of pipeline_name -> pipeline_instance)
         self.pipelines = {}
@@ -204,6 +206,7 @@ class PixelleVideoCore:
         self.frame_processor = FrameProcessor(self)
         self.persistence = PersistenceService(output_dir="output")
         self.history = HistoryManager(self.persistence)
+        self.publisher = PublisherService(self.config)
         
         # 2. Register video generation pipelines
         self.pipelines = {
@@ -236,6 +239,13 @@ class PixelleVideoCore:
             finally:
                 self._comfykit = None
                 self._comfykit_config_hash = None
+
+        # Close publisher browser sessions (if any)
+        if self.publisher:
+            try:
+                await self.publisher.close_all()
+            except Exception as e:
+                logger.error(f"Failed to close publisher sessions: {e}")
     
     async def __aenter__(self):
         """Async context manager entry"""
