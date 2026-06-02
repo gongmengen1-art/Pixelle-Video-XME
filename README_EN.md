@@ -32,6 +32,7 @@ Just input a **topic**, and Pixelle-Video will automatically:
 
 ## 📋 Recent Updates
 
+- ✅ **2026-06-02**: Custom Media mode voice & picture quality fixes — each paragraph is now synthesized as one continuous TTS utterance, eliminating mid-sentence breaks (subtitles aligned via edge-tts word-level timestamps, with a proportional fallback for ComfyUI backends); fixed picture flicker when looping short assets (normalize fps/timebase/SAR before looping, loop-seam crossfade tightened to 0.25s)
 - ✅ **2026-06-01**: Added the "One-Click Publish" module — semi-automatic publishing to Douyin / Xiaohongshu: the app auto-fills the title/topics and uploads the video, while you click the final **Publish** button yourself; scan-to-login once and the session is reused, runs locally only
 - ✅ **2026-05-29**: Custom Media mode adds cover-image upload (groundwork for one-click publishing to Douyin / Xiaohongshu); fixed "picture freezes when narration is longer than the video asset" — short assets are auto-looped with a 0.5s crossfade at the loop seam
 - ✅ **2026-05-28**: Major upgrade to Custom Media mode: precise subtitle-audio sync engine, multi-segment "+" script input, per-segment subtitle style/position config; fixed video-asset stutter at splice points

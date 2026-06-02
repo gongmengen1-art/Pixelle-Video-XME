@@ -138,6 +138,53 @@ class TTSService(ComfyBaseService):
                 **params
             )
     
+    async def synth_with_word_boundaries(
+        self,
+        text: str,
+        voice: Optional[str] = None,
+        speed: Optional[float] = None,
+        output_path: Optional[str] = None,
+        inference_mode: Optional[str] = None,
+    ) -> tuple[str, Optional[list]]:
+        """
+        Synthesize speech for a full text in one continuous utterance and return
+        word-level timing when the backend supports it.
+
+        Returns:
+            (audio_path, boundaries) where boundaries is a list of
+            {"text", "start", "end"} in seconds for local Edge TTS, or None when
+            the backend can't provide timings (e.g. ComfyUI workflows) — callers
+            should then fall back to proportional subtitle timing.
+        """
+        mode = inference_mode or self.config.get("inference_mode", "local")
+
+        if mode != "local":
+            # ComfyUI / remote backends: no word timing available.
+            path = await self.__call__(
+                text=text, voice=voice, speed=speed,
+                output_path=output_path, inference_mode=mode,
+            )
+            return path, None
+
+        from pixelle_video.utils.tts_util import edge_tts_with_boundaries
+
+        local_config = self.config.get("local", {})
+        final_voice = voice or local_config.get("voice", "zh-CN-YunjianNeural")
+        final_speed = speed if speed is not None else local_config.get("speed", 1.2)
+        rate = speed_to_rate(final_speed)
+
+        if not output_path:
+            output_path = f"output/{uuid.uuid4().hex}.mp3"
+            Path("output").mkdir(parents=True, exist_ok=True)
+
+        logger.info(
+            f"🎙️  Continuous Edge TTS: voice={final_voice}, speed={final_speed}x (rate={rate})"
+        )
+        _, boundaries = await edge_tts_with_boundaries(
+            text=text, voice=final_voice, rate=rate, output_path=output_path,
+        )
+        return output_path, boundaries
+
     async def _call_local_tts(
         self,
         text: str,

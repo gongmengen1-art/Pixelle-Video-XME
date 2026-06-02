@@ -123,6 +123,112 @@ def split_narration_into_subtitle_chunks(
     return chunks if chunks else [text]
 
 
+def map_subtitle_chunks_to_timeline(
+    text: str,
+    chunks: List[str],
+    boundaries: List[Dict[str, Any]] | None,
+    total_dur: float,
+) -> List[tuple]:
+    """
+    Map subtitle chunks to (t_start, duration) windows WITHIN one continuous
+    audio clip.
+
+    The narration is now TTS'd as a single utterance (continuous, natural
+    prosody), so subtitle display windows must be derived from timing inside
+    that audio rather than from per-chunk audio durations.
+
+    Two strategies:
+      • If `boundaries` (Edge TTS WordBoundary timings) are available, anchor each
+        chunk to the start time of the first spoken token that falls inside it —
+        precise alignment.
+      • Otherwise fall back to splitting `total_dur` proportionally to each
+        chunk's character length.
+
+    Windows are contiguous and gapless, covering [0, total_dur]; the last chunk
+    always extends to total_dur so no trailing frames are left uncovered.
+
+    Returns: list of (t_start, duration) tuples, one per chunk.
+    """
+    n = len(chunks)
+    if n == 0:
+        return []
+    if n == 1:
+        return [(0.0, total_dur)]
+
+    # Char ranges of each chunk inside the normalised narration text.
+    norm = " ".join(text.split())
+    ranges: List[tuple] = []
+    pos = 0
+    for ch in chunks:
+        start = norm.find(ch, pos)
+        if start < 0:
+            start = pos
+        end = start + len(ch)
+        ranges.append((start, end))
+        pos = end
+
+    def _proportional() -> List[tuple]:
+        lengths = [max(len(c), 1) for c in chunks]
+        tot = sum(lengths)
+        out, acc = [], 0.0
+        for k, L in enumerate(lengths):
+            d = total_dur * L / tot
+            # absorb rounding into the last chunk
+            if k == n - 1:
+                d = max(total_dur - acc, 0.0)
+            out.append((acc, d))
+            acc += d
+        return out
+
+    if not boundaries:
+        return _proportional()
+
+    # Anchor each spoken token to a char position in the narration text.
+    anchors: List[tuple] = []  # (char_pos, start_time)
+    cur = 0
+    for b in boundaries:
+        tok = (b.get("text") or "").strip()
+        if not tok:
+            continue
+        idx = norm.find(tok, cur)
+        if idx < 0:
+            idx = cur
+        anchors.append((idx, float(b.get("start", 0.0))))
+        cur = idx + len(tok)
+
+    if not anchors:
+        return _proportional()
+
+    # Each chunk start = first anchor at/after the chunk's start char.
+    starts = [None] * n
+    ai = 0
+    for i, (c0, _c1) in enumerate(ranges):
+        t = None
+        while ai < len(anchors) and anchors[ai][0] < c0:
+            ai += 1
+        if ai < len(anchors):
+            t = anchors[ai][1]
+        starts[i] = t
+
+    # First chunk always starts at 0; carry forward any gaps; keep monotonic.
+    starts[0] = 0.0
+    for i in range(1, n):
+        if starts[i] is None:
+            starts[i] = starts[i - 1]
+    for i in range(1, n):
+        if starts[i] < starts[i - 1]:
+            starts[i] = starts[i - 1]
+
+    out: List[tuple] = []
+    for i in range(n):
+        t0 = starts[i]
+        t1 = starts[i + 1] if i + 1 < n else total_dur
+        if t1 < t0:
+            t1 = t0
+        out.append((t0, t1 - t0))
+    return out
+
+
 def format_subtitle_text(text: str, max_lines: int = 2, chars_per_line: int = 20) -> str:
     """
     Wrap subtitle text at chars_per_line characters and limit to max_lines.

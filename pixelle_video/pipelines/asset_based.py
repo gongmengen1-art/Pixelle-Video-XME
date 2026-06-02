@@ -548,18 +548,16 @@ class AssetBasedPipeline(LinearVideoPipeline):
               concat audio).  No clip-splitting, no concat = zero stutter at boundaries.
             • Image asset: one sub-segment per chunk, then concat (static image, no issue).
         """
-        import shutil
-
         from pixelle_video.services.frame_html import HTMLFrameGenerator
-        from pixelle_video.services.video import VideoService
         from pixelle_video.utils.template_util import resolve_template_path
         from pixelle_video.utils.subtitle import (
             build_subtitle_template_vars,
             format_subtitle_text,
             split_narration_into_subtitle_chunks,
+            map_subtitle_chunks_to_timeline,
         )
 
-        logger.info("🎬 Producing scene videos (per-narration sync mode)...")
+        logger.info("🎬 Producing scene videos (continuous-TTS sync mode)...")
 
         storyboard = context.storyboard
         config = context.config
@@ -578,7 +576,6 @@ class AssetBasedPipeline(LinearVideoPipeline):
 
         template_path = resolve_template_path(config.frame_template)
         html_generator = HTMLFrameGenerator(template_path)
-        video_service = VideoService()
 
         frames_dir = Path(context.task_dir) / "frames"
         frames_dir.mkdir(parents=True, exist_ok=True)
@@ -592,10 +589,18 @@ class AssetBasedPipeline(LinearVideoPipeline):
                 narrations = [narrations]
             narration_styles: list = scene.get("narration_styles", [])
 
-            # ── Phase 1: TTS + subtitle PNG for every chunk ───────────────────
-            # chunks_info: [{audio, composed, duration, t_start, text}]
+            # ── Phase 1: continuous TTS per narration + subtitle PNGs ─────────
+            # Each narration paragraph is synthesised as ONE continuous utterance
+            # (natural prosody, no mid-sentence breaks).  Subtitle chunks are only
+            # a display concern: their time windows are derived from word-level
+            # timing inside that single audio, not by TTS-ing each chunk.
+            #
+            # scene_audios: ordered list of per-narration continuous audio files
+            # chunks_info:  subtitle overlay windows [{composed, duration, t_start, text}]
+            import ffmpeg as _ffmpeg
+            scene_audios: list = []
             chunks_info: list = []
-            video_offset = 0.0
+            video_offset = 0.0  # running scene-time cursor across narrations
 
             for j, narration_text in enumerate(narrations, 1):
                 narration_counter += 1
@@ -611,30 +616,36 @@ class AssetBasedPipeline(LinearVideoPipeline):
                 max_lines = int(sub_vars["_subtitle_max_lines"])
                 chars_per_line = int(sub_vars["_subtitle_chars_per_line"])
 
+                # 1. ONE continuous TTS for the whole paragraph (with word timing)
+                self._emit_progress(ProgressEvent(
+                    event_type="frame_step", progress=progress,
+                    frame_current=i, frame_total=total_frames, step=j, action="audio",
+                ))
+                audio_path = str(frames_dir / f"{i:02d}_n{j}.mp3")
+                _, boundaries = await self.core.tts.synth_with_word_boundaries(
+                    text=narration_text, output_path=audio_path,
+                    voice=config.voice_id, speed=config.tts_speed,
+                )
+
+                # 2. Continuous-audio duration
+                try:
+                    narr_dur = float(_ffmpeg.probe(audio_path)['format']['duration'])
+                except Exception:
+                    narr_dur = 5.0
+                scene_audios.append(audio_path)
+
+                # 3. Subtitle chunks (display only) + their time windows
                 chunks = split_narration_into_subtitle_chunks(narration_text, max_lines, chars_per_line)
-                logger.debug(f"  Scene {i} narration {j}: {len(chunks)} chunk(s)")
+                timings = map_subtitle_chunks_to_timeline(
+                    narration_text, chunks, boundaries, narr_dur
+                )
+                logger.debug(
+                    f"  Scene {i} narration {j}: {len(chunks)} chunk(s), "
+                    f"{narr_dur:.2f}s, {'word-aligned' if boundaries else 'proportional'}"
+                )
 
-                for c, chunk_text in enumerate(chunks, 1):
-                    self._emit_progress(ProgressEvent(
-                        event_type="frame_step", progress=progress,
-                        frame_current=i, frame_total=total_frames, step=j, action="audio",
-                    ))
-
-                    # 1. TTS
-                    audio_path = str(frames_dir / f"{i:02d}_n{j}_c{c}.mp3")
-                    await self.core.tts(
-                        text=chunk_text, output_path=audio_path,
-                        voice=config.voice_id, speed=config.tts_speed,
-                    )
-
-                    # 2. Get audio duration
-                    import ffmpeg as _ffmpeg
-                    try:
-                        chunk_dur = float(_ffmpeg.probe(audio_path)['format']['duration'])
-                    except Exception:
-                        chunk_dur = 5.0
-
-                    # 3. Render subtitle PNG
+                # 4. Render subtitle PNG per chunk; window offset by scene cursor
+                for c, (chunk_text, (ct0, cdur)) in enumerate(zip(chunks, timings), 1):
                     self._emit_progress(ProgressEvent(
                         event_type="frame_step", progress=min(progress + 0.01, 0.99),
                         frame_current=i, frame_total=total_frames, step=j, action="compose",
@@ -651,18 +662,22 @@ class AssetBasedPipeline(LinearVideoPipeline):
                     )
 
                     chunks_info.append({
-                        "audio": audio_path,
                         "composed": composed_path,
-                        "duration": chunk_dur,
-                        "t_start": video_offset,
+                        "duration": cdur,
+                        "t_start": video_offset + ct0,
                         "text": chunk_text,
                     })
-                    video_offset += chunk_dur
                     logger.debug(
-                        f"  Scene {i} n{j}/c{c}: {chunk_text[:30]}{'…' if len(chunk_text) > 30 else ''}"
+                        f"  Scene {i} n{j}/c{c} [{video_offset + ct0:.2f}+{cdur:.2f}s]: "
+                        f"{chunk_text[:30]}{'…' if len(chunk_text) > 30 else ''}"
                     )
 
+                video_offset += narr_dur
+
             # ── Phase 2: Build scene video ────────────────────────────────────
+            # One ffmpeg call: scale → time-ranged subtitle overlays → concat the
+            # continuous narration audios.  No clip-splitting, no per-chunk audio
+            # concat → continuous speech and zero frame-boundary stutter.
             self._emit_progress(ProgressEvent(
                 event_type="frame_step", progress=min(progress + 0.02, 0.99),
                 frame_current=i, frame_total=total_frames, step=len(narrations), action="video",
@@ -671,28 +686,19 @@ class AssetBasedPipeline(LinearVideoPipeline):
             final_segment = str(frames_dir / f"{i:02d}_segment.mp4")
 
             if frame.media_type == "video":
-                # Single ffmpeg call: scale + time-ranged subtitle overlays + audio concat.
-                # No intermediate clip files, no segment concat → no frame-boundary stutter.
                 self._build_video_scene(
                     source=frame.video_path,
-                    chunks=chunks_info,
+                    subtitle_chunks=chunks_info,
+                    audios=scene_audios,
                     output=final_segment,
                 )
             else:
-                # Image asset: create one sub-segment per chunk, then concat.
-                sub_paths = []
-                for k, info in enumerate(chunks_info, 1):
-                    sp = str(frames_dir / f"{i:02d}_sub_{k}.mp4")
-                    video_service.create_video_from_image(
-                        image=info["composed"], audio=info["audio"],
-                        output=sp, fps=config.video_fps,
-                    )
-                    sub_paths.append(sp)
-
-                if len(sub_paths) == 1:
-                    shutil.copy(sub_paths[0], final_segment)
-                else:
-                    self._concat_segments(sub_paths, final_segment)
+                self._build_image_scene(
+                    image=frame.image_path,
+                    subtitle_chunks=chunks_info,
+                    audios=scene_audios,
+                    output=final_segment,
+                )
 
             frame.video_segment_path = final_segment
             logger.success(f"✅ Scene {i} complete ({len(chunks_info)} subtitle chunk(s))")
@@ -985,75 +991,116 @@ class AssetBasedPipeline(LinearVideoPipeline):
         subprocess.run(cmd, check=True, capture_output=True)
         logger.debug(f"_concat_segments: {n} segments → {output}")
 
-    def _build_video_scene(self, source: str, chunks: list, output: str) -> None:
+    def _probe_total_audio_dur(self, audios: list, fallback: float) -> float:
+        """Sum the durations of the continuous narration audio tracks."""
+        import ffmpeg as _ffmpeg
+        total = 0.0
+        for a in audios:
+            try:
+                total += float(_ffmpeg.probe(a)["format"]["duration"])
+            except Exception:
+                logger.warning(f"Failed to probe audio duration for {a}")
+        return total if total > 0 else fallback
+
+    def _subtitle_overlay_chain(self, subtitle_chunks: list, vref: str) -> list:
+        """Build the chained subtitle overlay filter parts (PNG inputs [1..K])."""
+        parts = []
+        for idx, c in enumerate(subtitle_chunks):
+            t0 = c["t_start"]
+            t1 = c["t_start"] + c["duration"]
+            vout = f"[v{idx}]"
+            parts.append(
+                f"{vref}[{idx + 1}:v]overlay=enable='between(t,{t0:.4f},{t1:.4f})'{vout}"
+            )
+            vref = vout
+        return parts, vref
+
+    def _audio_concat_chain(self, audios: list, base_idx: int) -> list:
+        """
+        Normalise each continuous narration track (sample rate / layout / pts)
+        then concat them into [aout].  Normalising before concat keeps the join
+        robust across ffmpeg versions (same rationale as the transition fix).
+        """
+        m = len(audios)
+        parts, labels = [], []
+        for idx in range(m):
+            lbl = f"[a{idx}n]"
+            parts.append(
+                f"[{base_idx + idx}:a]aresample=44100,"
+                f"aformat=channel_layouts=stereo,asetpts=PTS-STARTPTS{lbl}"
+            )
+            labels.append(lbl)
+        parts.append("".join(labels) + f"concat=n={m}:v=0:a=1[aout]")
+        return parts
+
+    def _build_video_scene(
+        self, source: str, subtitle_chunks: list, audios: list, output: str
+    ) -> None:
         """
         Build a scene video for a VIDEO asset in a single ffmpeg call.
 
-        The source video is scaled to 1080×1920 (contain / letterbox), then each
-        subtitle PNG is overlaid only during its time window, and all TTS audio
-        tracks are concatenated.  Because there is no clip-extraction or segment
-        concat, playback is completely continuous — zero stutter at chunk boundaries.
+        The source video is normalised (constant fps + timebase + SAR, reset PTS)
+        and scaled to 1080×1920 (contain / letterbox), each subtitle PNG is
+        overlaid only during its time window, and the continuous per-narration
+        audio tracks are concatenated.  No clip-extraction, no per-chunk audio
+        concat → continuous speech and zero stutter at chunk boundaries.
 
-        If the source video is SHORTER than the narration audio total, the source
-        is looped (replicated via split) and the loop boundary is smoothed with a
-        0.5s xfade dissolve, so the picture never freezes on the last frame.
+        If the source is SHORTER than the narration total, it is looped
+        (replicated via split) and each seam is smoothed with a short xfade so the
+        picture never freezes on the last frame.
 
-        chunks: list of dicts with keys: audio, composed, duration, t_start
+        Normalising the source BEFORE split/xfade/overlay is essential: VFR assets
+        carry irregular PTS/timebase, which otherwise makes the loop seam glitch
+        (stale/black frame flashes) and can even abort xfade on ffmpeg 8.x.
+
+        subtitle_chunks: [{composed, duration, t_start, text}]
+        audios:          ordered continuous narration audio files
         """
         import math
         import subprocess
         import ffmpeg as _ffmpeg
 
-        n = len(chunks)
-        total_dur = sum(c["duration"] for c in chunks)
+        K = len(subtitle_chunks)
+        M = len(audios)
+        total_dur = self._probe_total_audio_dur(
+            audios, fallback=sum(c["duration"] for c in subtitle_chunks) or 1.0
+        )
         W, H = 1080, 1920
-        XFADE_DUR = 0.5  # seconds of crossfade at each loop boundary
+        XFADE_DUR = 0.25  # short crossfade at each loop boundary (less dissolve pulse)
 
-        # Probe source duration to decide whether we need to loop the source
         try:
             src_dur = float(_ffmpeg.probe(source)["format"]["duration"])
         except Exception:
             logger.warning(f"Failed to probe duration for {source}; assuming no loop needed")
             src_dur = total_dur + 1.0
 
-        # How many copies of the source do we need?
-        #   total covered = n_copies * src_dur - (n_copies - 1) * XFADE_DUR
-        #   require: covered >= total_dur
-        #   => n_copies >= (total_dur - XFADE_DUR) / (src_dur - XFADE_DUR)
+        # How many copies of the source do we need to cover total_dur?
+        #   covered = n_copies * src_dur - (n_copies - 1) * XFADE_DUR
         if total_dur <= src_dur or src_dur <= XFADE_DUR * 2:
             n_copies = 1
         else:
             n_copies = max(2, math.ceil((total_dur - XFADE_DUR) / (src_dur - XFADE_DUR)))
 
-        cmd = ["ffmpeg", "-y"]
-        # [0] source video — full file, no pre-trimming
-        cmd += ["-i", source]
-        # [1 … n] subtitle PNGs, looped so the overlay filter can hold them
-        # for their entire time window
-        for c in chunks:
+        cmd = ["ffmpeg", "-y", "-i", source]
+        for c in subtitle_chunks:
             cmd += ["-loop", "1", "-i", c["composed"]]
-        # [n+1 … 2n] TTS audio clips
-        for c in chunks:
-            cmd += ["-i", c["audio"]]
+        for a in audios:
+            cmd += ["-i", a]
 
-        # ── filter_complex ──────────────────────────────────────────────────
         parts = []
 
-        # Scale source video to template size (contain = letterbox black bars)
-        scale_pad = (
+        # Normalise + scale the source: constant fps/timebase/SAR, reset PTS.
+        norm = (
+            f"[0:v]fps=30,"
             f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
-            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black"
+            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"setsar=1,settb=AVTB,setpts=PTS-STARTPTS"
         )
 
         if n_copies == 1:
-            # Source is long enough — no loop, single pass
-            parts.append(f"[0:v]{scale_pad}[scaled]")
+            parts.append(f"{norm}[scaled]")
         else:
-            # Replicate the scaled source N times, then crossfade the seams
-            parts.append(
-                f"[0:v]{scale_pad},split={n_copies}"
-                + "".join(f"[s{i}]" for i in range(n_copies))
-            )
+            parts.append(norm + f",split={n_copies}" + "".join(f"[s{i}]" for i in range(n_copies)))
             current = "[s0]"
             for i in range(1, n_copies):
                 is_last = i == n_copies - 1
@@ -1065,26 +1112,15 @@ class AssetBasedPipeline(LinearVideoPipeline):
                 )
                 current = next_label
 
-        # Chain subtitle overlays; each is visible only during its time window
-        vref = "[scaled]"
-        for idx, c in enumerate(chunks):
-            t0, t1 = c["t_start"], c["t_start"] + c["duration"]
-            vout = f"[v{idx}]"
-            parts.append(
-                f"{vref}[{idx + 1}:v]overlay=enable='between(t,{t0:.4f},{t1:.4f})'{vout}"
-            )
-            vref = vout
+        overlay_parts, vref = self._subtitle_overlay_chain(subtitle_chunks, "[scaled]")
+        parts += overlay_parts
 
-        # Trim video to exact scene duration (prevents trailing source footage)
         parts.append(f"{vref}trim=duration={total_dur:.4f},setpts=PTS-STARTPTS[vout]")
+        parts += self._audio_concat_chain(audios, base_idx=1 + K)
 
-        # Concatenate TTS audio tracks
-        audio_inputs = "".join(f"[{n + 1 + idx}:a]" for idx in range(n))
-        parts.append(f"{audio_inputs}concat=n={n}:v=0:a=1[aout]")
-
-        cmd += ["-filter_complex", "; ".join(parts)]
-        cmd += ["-map", "[vout]", "-map", "[aout]"]
         cmd += [
+            "-filter_complex", "; ".join(parts),
+            "-map", "[vout]", "-map", "[aout]",
             "-c:v", "libx264", "-c:a", "aac",
             "-pix_fmt", "yuv420p", "-crf", "23", "-preset", "medium",
             output,
@@ -1092,7 +1128,60 @@ class AssetBasedPipeline(LinearVideoPipeline):
 
         subprocess.run(cmd, check=True, capture_output=True)
         logger.debug(
-            f"_build_video_scene: {n} chunks, narration={total_dur:.2f}s, "
+            f"_build_video_scene: {K} chunks / {M} audios, narration={total_dur:.2f}s, "
             f"src={src_dur:.2f}s, loops={n_copies} → {output}"
+        )
+
+    def _build_image_scene(
+        self, image: str, subtitle_chunks: list, audios: list, output: str
+    ) -> None:
+        """
+        Build a scene video for an IMAGE asset in a single ffmpeg call.
+
+        Same shape as _build_video_scene but the source is a still: it is looped
+        (-loop 1) to fill the scene, scaled/letterboxed, time-ranged subtitle PNGs
+        are overlaid, and the continuous narration audios are concatenated.  This
+        replaces the old per-chunk create_video_from_image + concat path, so the
+        audio stays continuous (no mid-sentence breaks) for image scenes too.
+        """
+        import subprocess
+
+        K = len(subtitle_chunks)
+        M = len(audios)
+        total_dur = self._probe_total_audio_dur(
+            audios, fallback=sum(c["duration"] for c in subtitle_chunks) or 1.0
+        )
+        W, H = 1080, 1920
+
+        cmd = ["ffmpeg", "-y", "-loop", "1", "-i", image]
+        for c in subtitle_chunks:
+            cmd += ["-loop", "1", "-i", c["composed"]]
+        for a in audios:
+            cmd += ["-i", a]
+
+        parts = [
+            f"[0:v]fps=30,"
+            f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"setsar=1,settb=AVTB,setpts=PTS-STARTPTS[scaled]"
+        ]
+
+        overlay_parts, vref = self._subtitle_overlay_chain(subtitle_chunks, "[scaled]")
+        parts += overlay_parts
+
+        parts.append(f"{vref}trim=duration={total_dur:.4f},setpts=PTS-STARTPTS[vout]")
+        parts += self._audio_concat_chain(audios, base_idx=1 + K)
+
+        cmd += [
+            "-filter_complex", "; ".join(parts),
+            "-map", "[vout]", "-map", "[aout]",
+            "-c:v", "libx264", "-c:a", "aac",
+            "-pix_fmt", "yuv420p", "-crf", "23", "-preset", "medium",
+            output,
+        ]
+
+        subprocess.run(cmd, check=True, capture_output=True)
+        logger.debug(
+            f"_build_image_scene: {K} chunks / {M} audios, narration={total_dur:.2f}s → {output}"
         )
 

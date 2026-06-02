@@ -224,6 +224,98 @@ async def edge_tts(
             raise RuntimeError("Edge TTS failed without error (unexpected)")
 
 
+async def edge_tts_with_boundaries(
+    text: str,
+    voice: str = "[Chinese] zh-CN Yunjian",
+    rate: str = "+0%",
+    volume: str = "+0%",
+    pitch: str = "+0Hz",
+    output_path: str = None,
+    retry_count: int = _RETRY_COUNT,
+    retry_base_delay: float = _RETRY_BASE_DELAY,
+) -> tuple[bytes, list[dict]]:
+    """
+    Same as edge_tts() but ALSO captures word-level timing.
+
+    Edge TTS streams WordBoundary events alongside the audio; the plain
+    edge_tts() helper throws them away.  Here we collect them so callers can
+    align subtitle chunks to a single continuous utterance instead of having to
+    TTS each chunk separately (which produces choppy, broken speech).
+
+    Returns:
+        (audio_bytes, boundaries) where boundaries is an ordered list of
+        {"text": str, "start": float_seconds, "end": float_seconds}.
+        Edge TTS reports offset/duration in 100-nanosecond ticks; we convert to
+        seconds.  Timings already reflect the requested rate.
+    """
+    request_semaphore = _get_request_semaphore()
+    async with request_semaphore:
+        await asyncio.sleep(_REQUEST_DELAY + random.uniform(0, 0.3))
+
+        last_error = None
+        for attempt in range(retry_count + 1):
+            if attempt > 0:
+                exponential_delay = retry_base_delay * (2 ** (attempt - 1))
+                jitter = random.uniform(0, retry_base_delay)
+                retry_delay = min(exponential_delay + jitter, _MAX_RETRY_DELAY)
+                logger.info(
+                    f"🔄 Retrying Edge TTS w/boundaries "
+                    f"(attempt {attempt + 1}/{retry_count + 1}) after {retry_delay:.2f}s..."
+                )
+                await asyncio.sleep(retry_delay)
+
+            try:
+                communicate = edge_tts_sdk.Communicate(
+                    text=text, voice=voice, rate=rate, volume=volume, pitch=pitch,
+                )
+
+                audio_chunks: list[bytes] = []
+                boundaries: list[dict] = []
+                async for chunk in communicate.stream():
+                    ctype = chunk["type"]
+                    if ctype == "audio":
+                        audio_chunks.append(chunk["data"])
+                    elif ctype == "WordBoundary":
+                        start = chunk.get("offset", 0) / 1e7
+                        dur = chunk.get("duration", 0) / 1e7
+                        boundaries.append({
+                            "text": chunk.get("text", ""),
+                            "start": start,
+                            "end": start + dur,
+                        })
+
+                audio_data = b"".join(audio_chunks)
+                if output_path:
+                    with open(output_path, "wb") as f:
+                        f.write(audio_data)
+                    logger.info(f"Audio saved to: {output_path} ({len(boundaries)} word boundaries)")
+
+                return audio_data, boundaries
+
+            except (WSServerHandshakeError, ClientResponseError) as e:
+                last_error = e
+                logger.warning(
+                    f"⚠️  Edge TTS boundary error (attempt {attempt + 1}/{retry_count + 1}): {e}"
+                )
+                if attempt >= retry_count:
+                    raise
+            except NoAudioReceived as e:
+                last_error = e
+                logger.warning(
+                    f"⚠️  Edge TTS NoAudioReceived (attempt {attempt + 1}/{retry_count + 1})"
+                )
+                if attempt >= retry_count:
+                    raise
+                await asyncio.sleep(2.0)
+            except Exception as e:
+                logger.error(f"Edge TTS boundary error (non-retryable): {type(e).__name__} - {e}")
+                raise
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("Edge TTS failed without error (unexpected)")
+
+
 def get_audio_duration(audio_path: str) -> float:
     """
     Get audio file duration in seconds
