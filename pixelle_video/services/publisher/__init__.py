@@ -17,6 +17,7 @@ via Playwright browser automation.
 
 from pixelle_video.services.publisher.base import (
     BasePublisher,
+    FormField,
     PublishRequest,
     PublishResult,
 )
@@ -26,6 +27,7 @@ from pixelle_video.services.publisher.service import PublisherService
 __all__ = [
     "PublishBrowser",
     "BasePublisher",
+    "FormField",
     "PublishRequest",
     "PublishResult",
     "PublisherService",

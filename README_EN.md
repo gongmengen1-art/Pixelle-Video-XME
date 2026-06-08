@@ -32,6 +32,7 @@ Just input a **topic**, and Pixelle-Video will automatically:
 
 ## 📋 Recent Updates
 
+- ✅ **2026-06-07**: "One-Click Publish" upgrade — added WeChat Channels; multiple platforms now share a **single publish button** (opens each platform's browser in turn and pre-fills it, then keeps all windows open and waits for you to click Publish manually); fixed the client-side exception when closing the browser without publishing — now shown cleanly as "publish cancelled"
 - ✅ **2026-06-02**: Custom Media mode voice & picture quality fixes — each paragraph is now synthesized as one continuous TTS utterance, eliminating mid-sentence breaks (subtitles aligned via edge-tts word-level timestamps, with a proportional fallback for ComfyUI backends); fixed picture flicker when looping short assets (normalize fps/timebase/SAR before looping, loop-seam crossfade tightened to 0.25s)
 - ✅ **2026-06-01**: Added the "One-Click Publish" module — semi-automatic publishing to Douyin / Xiaohongshu: the app auto-fills the title/topics and uploads the video, while you click the final **Publish** button yourself; scan-to-login once and the session is reused, runs locally only
 - ✅ **2026-05-29**: Custom Media mode adds cover-image upload (groundwork for one-click publishing to Douyin / Xiaohongshu); fixed "picture freezes when narration is longer than the video asset" — short assets are auto-looped with a 0.5s crossfade at the loop seam
@@ -66,7 +67,7 @@ Just input a **topic**, and Pixelle-Video will automatically:
 - ✅ **Subtitle Style & Position** - Configurable position (top / middle / bottom), chars-per-line, max lines; styles injected via CSS presets — add new styles without touching the HTML template
 - ✅ **Custom Cover Upload** - In Custom Media mode, upload a cover image; saved alongside the video (`{task_id}_cover.{ext}`) and recorded in `metadata.json` — ready as the integration point for one-click publishing to Douyin, Xiaohongshu, etc.
 - ✅ **Smart Video Looping** - When the narration is longer than the video asset, the source is automatically looped with a 0.5s crossfade at the loop seam — picture never freezes; when the video is longer than the narration, it is trimmed to fit
-- ✅ **One-Click Publish to Douyin / Xiaohongshu** - A dedicated "📤 Publish" tab powered by Playwright browser automation; a semi-automatic flow auto-fills the title/topics and uploads the video, then you click the final **Publish** button in the browser yourself; scan-to-login once and the session is reused (stored locally); adding a new platform only requires subclassing `BasePublisher`
+- ✅ **One-Click Publish to Douyin / Xiaohongshu / WeChat Channels** - A dedicated "📤 Publish" tab powered by Playwright browser automation; one button publishes to all selected platforms: it opens each platform's browser in turn, auto-fills the title/topics and uploads the video, then keeps every window open for you to click the final **Publish** yourself; scan-to-login once and the session is reused (stored locally); closing a window without publishing is reported as "publish cancelled" instead of an error; adding a new platform only requires subclassing `BasePublisher`
 
 
 ## 📊 Video Generation Pipeline

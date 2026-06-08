@@ -19,7 +19,7 @@ final "发布" click (semi-automatic).
 
 from loguru import logger
 
-from pixelle_video.services.publisher.base import BasePublisher, PublishRequest
+from pixelle_video.services.publisher.base import BasePublisher, FormField, PublishRequest
 
 
 class XhsPublisher(BasePublisher):
@@ -27,9 +27,19 @@ class XhsPublisher(BasePublisher):
     display_name = "小红书"
     login_url = "https://creator.xiaohongshu.com/"
     upload_url = "https://creator.xiaohongshu.com/publish/publish?source=official"
+
+    # Fillable fields for this platform (see BasePublisher.FORM_FIELDS).
+    FORM_FIELDS = [
+        FormField("title", "标题", "text", max_len=20),
+        FormField("description", "正文", "textarea", max_len=1000),
+        FormField("topics", "话题标签", "topics", help="空格分隔，不含 #"),
+    ]
     # Xiaohongshu's post-publish redirect varies; leave empty and rely on the
     # user closing the window as the completion signal (set if found stable).
     success_url_part = ""
+    # Auth cookie planted only after a successful login (guests get a1/webId
+    # visitor cookies instead, which must NOT be used as a login signal).
+    login_cookie_names = ("web_session",)
 
     # NOTE: verify against the live page. Xiaohongshu requires selecting the
     # "上传视频" tab before the file input appears. Update selectors here when
@@ -39,14 +49,7 @@ class XhsPublisher(BasePublisher):
     TITLE_INPUT = 'input[placeholder*="标题"]'
     CONTENT_EDITOR = 'div[contenteditable="true"], textarea[placeholder*="正文"]'
 
-    async def is_logged_in(self, page) -> bool:
-        if "login" in (page.url or ""):
-            return False
-        try:
-            await page.wait_for_selector(f"{self.VIDEO_TAB}, {self.FILE_INPUT}", timeout=5000)
-            return True
-        except Exception:
-            return False
+    # is_logged_in() inherited from BasePublisher (cookie/URL based, DOM-independent).
 
     async def fill_publish_form(self, page, req: PublishRequest) -> None:
         # 1) ensure the "upload video" tab is active
@@ -56,9 +59,8 @@ class XhsPublisher(BasePublisher):
         except Exception:
             logger.debug("[xiaohongshu] video tab not found (maybe already selected)")
 
-        # 2) upload the video file
-        file_input = await page.wait_for_selector(self.FILE_INPUT, timeout=30000)
-        await file_input.set_input_files(req.video_path)
+        # 2) upload the video file (hidden + re-rendered input → locator-based helper)
+        await self._set_file_input(page, self.FILE_INPUT, req.video_path)
         logger.info("[xiaohongshu] uploading video, waiting for the edit page...")
 
         # 3) title (Xiaohongshu title cap ~20 chars)

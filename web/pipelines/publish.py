@@ -170,81 +170,132 @@ class PublishPipelineUI(PipelineUI):
         with st.container(border=True):
             st.markdown(f"**{tr('publish.section.info', fallback='发布信息')}**")
 
-            title = st.text_input(
-                tr("publish.title", fallback="标题"),
-                value=st.session_state.get("publish_title", ""),
-                key="pub_title",
-            )
-            topics_str = st.text_input(
-                tr("publish.topics", fallback="话题标签（空格分隔，不含 #）"),
-                key="pub_topics",
-            )
-            description = st.text_area(
-                tr("publish.description", fallback="描述 / 正文"),
-                height=100,
-                key="pub_desc",
-            )
+            # 1) Platform selection on top — drives which fields are shown.
             platforms = st.multiselect(
-                tr("publish.platforms", fallback="发布平台"),
+                tr("publish.platforms", fallback="发布平台（可多选）"),
                 options=publisher.supported_platforms(),
                 format_func=publisher.display_name,
                 key="pub_platforms",
             )
+            if not platforms:
+                st.info(tr("publish.need_platform", fallback="请至少选择一个发布平台以显示对应可填字段"))
+                return
+
+            # 2) Dynamic fields: union of the selected platforms' fields, merged
+            #    by key; platform-specific ones are marked.
+            field_values = self._render_dynamic_fields(publisher, platforms)
 
             st.caption(tr(
                 "publish.semi_auto_hint",
                 fallback="发布时会逐个平台打开浏览器并自动填好，请在浏览器中核对并手动点击【发布】。",
             ))
-
             if not video_path:
                 st.info(tr("publish.need_video", fallback="请先在左侧选择或上传一个视频"))
-            if not platforms:
-                st.info(tr("publish.need_platform", fallback="请至少选择一个发布平台"))
 
-            topics = [t.lstrip("#") for t in topics_str.split() if t.strip()]
-            base_ready = bool(video_path and title and platforms)
+            # 3) One-click publish to all selected platforms.
+            has_content = any(
+                str(v).strip() for k, v in field_values.items() if k != "topics"
+            ) or bool(field_values.get("topics"))
+            base_ready = bool(video_path and has_content)
 
-            for platform in platforms:
-                name = publisher.display_name(platform)
-                if not publisher.has_login(platform):
-                    st.warning(tr(
-                        "publish.platform_need_login",
-                        fallback="{name} 未登录，请先在左侧扫码登录",
-                        name=name,
-                    ))
-                disabled = not base_ready or not publisher.has_login(platform)
-                if st.button(
-                    tr("publish.publish_btn", fallback="📤 发布到 {name}", name=name),
-                    key=f"pub_do_{platform}",
-                    type="primary",
-                    use_container_width=True,
-                    disabled=disabled,
-                ):
-                    self._do_publish(publisher, platform, name, video_path, title, description, topics)
+            # Platforms that still need login: still selectable, but flagged and
+            # skipped (reported as "未登录") rather than blocking the whole batch.
+            need_login = [p for p in platforms if not publisher.has_login(p)]
+            for platform in need_login:
+                st.warning(tr(
+                    "publish.platform_need_login",
+                    fallback="{name} 未登录，请先在左侧扫码登录（本次将跳过该平台）",
+                    name=publisher.display_name(platform),
+                ))
 
-    def _do_publish(self, publisher, platform, name, video_path, title, description, topics):
+            btn_label = tr(
+                "publish.publish_all_btn",
+                fallback="📤 一键发布（{n} 个平台）",
+                n=len(platforms),
+            )
+            if st.button(
+                btn_label,
+                key="pub_do_all",
+                type="primary",
+                use_container_width=True,
+                disabled=not base_ready,
+            ):
+                self._do_publish(publisher, platforms, video_path, field_values)
+
+    def _render_dynamic_fields(self, publisher, platforms: List[str]) -> dict:
+        """Render the merged publish-form fields for the selected platforms and
+        return collected values keyed by field key (topics as a list of str)."""
+        merged = publisher.merged_form_fields(platforms)
+        values: dict = {}
+        multi = len(platforms) > 1
+        for fld in merged:
+            key = fld["key"]
+            label = " / ".join(fld["labels"])
+            # Mark platform-specific vs common fields.
+            if multi and not fld["is_common"]:
+                only = "、".join(publisher.display_name(p) for p in fld["platforms"])
+                label = f"{label}（仅 {only}）"
+            elif multi and fld["is_common"]:
+                label = f"{label}（通用）"
+
+            # Per-platform char caps + field help → caption.
+            caps = fld.get("max_by_platform") or {}
+            hint_parts = []
+            if caps:
+                hint_parts.append(
+                    " · ".join(f"{publisher.display_name(p)}≤{n}" for p, n in caps.items())
+                )
+            if fld.get("help"):
+                hint_parts.append(fld["help"])
+            help_text = "；".join(hint_parts) or None
+
+            wkey = f"pub_field_{key}"
+            if fld["kind"] == "textarea":
+                values[key] = st.text_area(label, height=100, key=wkey, help=help_text)
+            elif fld["kind"] == "topics":
+                raw = st.text_input(label, key=wkey, help=help_text)
+                values[key] = [t.lstrip("#") for t in raw.split() if t.strip()]
+            else:  # text
+                default = st.session_state.get("publish_title", "") if key == "title" else ""
+                values[key] = st.text_input(label, value=default, key=wkey, help=help_text)
+        return values
+
+    def _do_publish(self, publisher, platforms: List[str], video_path, field_values: dict):
         req = PublishRequest(
             video_path=video_path,
-            title=title,
-            description=description,
-            topics=topics,
+            title=field_values.get("title", "") or "",
+            short_title=field_values.get("short_title", "") or "",
+            description=field_values.get("description", "") or "",
+            topics=field_values.get("topics", []) or [],
         )
         with st.spinner(tr(
-            "publish.publishing",
-            fallback="正在打开浏览器并填写 {name} 的发布表单，请在浏览器中核对并点击【发布】...",
-            name=name,
+            "publish.publishing_all",
+            fallback="正在依次打开浏览器并填写各平台的发布表单，请在每个窗口中核对并手动点击【发布】...",
         )):
             try:
-                result = run_async(publisher.publish(platform, req))
+                results = run_async(publisher.publish_many(platforms, req))
             except Exception as e:
                 logger.exception("publish failed")
-                st.error(f"{name}: {e}")
+                st.error(str(e))
                 return
 
-        if result.success:
-            st.success(f"{name} · {result.detail}")
+        for result in results:
+            name = publisher.display_name(result.platform)
+            self._render_result(name, result)
+
+    @staticmethod
+    def _render_result(name: str, result) -> None:
+        """Render one platform's outcome with a status-appropriate widget."""
+        status = getattr(result, "status", "success" if result.success else "failed")
+        text = f"{name} · {result.detail}"
+        if status == "success":
+            st.success(text)
+        elif status == "cancelled":
+            st.info(text)
+        elif status == "timeout":
+            st.warning(text)
         else:
-            st.error(f"{name} · {result.detail}")
+            st.error(text)
 
 
 # Register self

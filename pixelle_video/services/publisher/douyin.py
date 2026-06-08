@@ -19,7 +19,7 @@ Automates the upload form on creator.douyin.com and stops before the final
 
 from loguru import logger
 
-from pixelle_video.services.publisher.base import BasePublisher, PublishRequest
+from pixelle_video.services.publisher.base import BasePublisher, FormField, PublishRequest
 
 
 class DouyinPublisher(BasePublisher):
@@ -29,6 +29,15 @@ class DouyinPublisher(BasePublisher):
     upload_url = "https://creator.douyin.com/creator-micro/content/upload"
     # After publishing, Douyin redirects to the content management page.
     success_url_part = "creator-micro/content/manage"
+    # Auth cookies planted only after a successful login (absent for guests).
+    login_cookie_names = ("sessionid", "sessionid_ss")
+
+    # Fillable fields for this platform (see BasePublisher.FORM_FIELDS).
+    FORM_FIELDS = [
+        FormField("title", "标题", "text", max_len=30),
+        FormField("description", "简介", "textarea", max_len=1000),
+        FormField("topics", "话题标签", "topics", help="空格分隔，不含 #"),
+    ]
 
     # NOTE: Douyin's creator center changes its DOM frequently. These selectors
     # are sensible defaults based on the public upload flow and MUST be verified
@@ -38,27 +47,18 @@ class DouyinPublisher(BasePublisher):
     TITLE_INPUT = 'input[placeholder*="标题"], input[placeholder*="作品"]'
     CAPTION_EDITOR = 'div.editor-kit-container [contenteditable="true"], div[contenteditable="true"]'
 
-    async def is_logged_in(self, page) -> bool:
-        if "login" in (page.url or ""):
-            return False
-        try:
-            # A logged-in session can reach the upload page and render its file input.
-            await page.wait_for_selector(self.FILE_INPUT, timeout=5000)
-            return True
-        except Exception:
-            return False
+    # is_logged_in() inherited from BasePublisher (cookie/URL based, DOM-independent).
 
     async def fill_publish_form(self, page, req: PublishRequest) -> None:
-        # 1) upload the video file
-        file_input = await page.wait_for_selector(self.FILE_INPUT, timeout=30000)
-        await file_input.set_input_files(req.video_path)
+        # 1) upload the video file (hidden + re-rendered input → locator-based helper)
+        await self._set_file_input(page, self.FILE_INPUT, req.video_path)
         logger.info("[douyin] uploading video, waiting for the edit page...")
 
         # 2) wait for the edit page — the title field appears once upload is accepted
         title = await page.wait_for_selector(self.TITLE_INPUT, timeout=180000)
 
-        # 3) title (Douyin title cap ~55 chars)
-        await title.fill(req.title[:55])
+        # 3) title (Douyin title cap ~30 chars)
+        await title.fill(req.title[:30])
 
         # 4) caption + topics into the rich-text editor
         caption = req.description or ""
