@@ -418,7 +418,13 @@ class HTMLFrameGenerator:
                 with os.fdopen(fd, 'w', encoding='utf-8') as f:
                     f.write(html)
                 
-                await page.goto(Path(tmp_html_path).as_uri(), wait_until='networkidle')
+                # 'load' fires as soon as the document + its (local) resources are
+                # ready. The template uses only local system fonts and — for subtitle
+                # overlays — no background image, so there is nothing to wait on the
+                # network for. 'networkidle' would otherwise add a fixed 500ms idle
+                # window per render, which dominates when a scene has many subtitle
+                # chunks.
+                await page.goto(Path(tmp_html_path).as_uri(), wait_until='load')
                 await page.screenshot(path=output_path, type='png', omit_background=True)
             finally:
                 await page.close()

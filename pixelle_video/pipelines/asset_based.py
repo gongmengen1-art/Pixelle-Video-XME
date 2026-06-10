@@ -32,6 +32,7 @@ Example:
     )
 """
 
+import asyncio
 from typing import List, Dict, Any, Optional, Callable
 from pathlib import Path
 
@@ -259,8 +260,19 @@ class AssetBasedPipeline(LinearVideoPipeline):
             else:
                 logger.warning(f"Unknown asset type: {asset_path}")
         
+        # asset_index is keyed by path, so two inputs resolving to the same path
+        # collapse into one entry. With unique upload paths this shouldn't happen;
+        # warn loudly if it ever does rather than silently dropping assets.
+        existing = sum(1 for p in assets if Path(p).exists())
+        if len(self.asset_index) < existing:
+            logger.warning(
+                f"⚠️  {existing} valid assets provided but only {len(self.asset_index)} "
+                f"indexed — {existing - len(self.asset_index)} collapsed due to duplicate "
+                f"paths. Some uploaded assets will NOT appear in the final video."
+            )
+
         logger.success(f"✅ Asset analysis complete: {len(self.asset_index)} assets indexed")
-        
+
         # Store asset index in context
         context.asset_index = self.asset_index
         
@@ -602,6 +614,18 @@ class AssetBasedPipeline(LinearVideoPipeline):
             chunks_info: list = []
             video_offset = 0.0  # running scene-time cursor across narrations
 
+            # Subtitle PNGs are independent of each other (different text, same
+            # transparent canvas), so render them concurrently rather than one
+            # blocking await at a time. A small semaphore bounds the number of
+            # in-flight Playwright pages. Tasks are collected here and awaited
+            # together just before the scene is assembled (Phase 2).
+            render_tasks: list = []
+            render_sem = asyncio.Semaphore(6)
+
+            async def _render_subtitle(**kwargs):
+                async with render_sem:
+                    await html_generator.generate_frame(**kwargs)
+
             for j, narration_text in enumerate(narrations, 1):
                 narration_counter += 1
                 progress = base_progress + narration_counter / max(all_narrations_count, 1) * progress_range
@@ -655,11 +679,17 @@ class AssetBasedPipeline(LinearVideoPipeline):
                     if config.template_params:
                         ext.update(config.template_params)
                     ext.update(sub_vars)
-                    media_path = frame.video_path if frame.media_type == "video" else frame.image_path
-                    await html_generator.generate_frame(
-                        title=storyboard.title, text=format_subtitle_text(chunk_text, max_lines, chars_per_line),
-                        image=media_path, ext=ext, output_path=composed_path,
-                    )
+                    # Render the subtitle as a TRANSPARENT overlay only — no
+                    # background image. The actual background (video frame / photo)
+                    # is the ffmpeg source layer in Phase 2, so baking it into every
+                    # subtitle PNG is pure redundant work (and for video assets the
+                    # .mp4 can't load as an <img> anyway). Dropping it makes each
+                    # render an order of magnitude faster and the PNG smaller.
+                    render_tasks.append(_render_subtitle(
+                        title=storyboard.title,
+                        text=format_subtitle_text(chunk_text, max_lines, chars_per_line),
+                        image="", ext=ext, output_path=composed_path,
+                    ))
 
                     chunks_info.append({
                         "composed": composed_path,
@@ -673,6 +703,16 @@ class AssetBasedPipeline(LinearVideoPipeline):
                     )
 
                 video_offset += narr_dur
+
+            # All subtitle overlays for this scene render concurrently; wait for
+            # them to finish before assembling the scene video. Pre-warm the shared
+            # Playwright browser first: _ensure_browser() has no internal lock, so
+            # firing the tasks cold would let several coroutines each launch a
+            # browser. One warm-up here makes the concurrent new_page() calls reuse
+            # the single shared instance.
+            if render_tasks:
+                await html_generator._ensure_browser()
+                await asyncio.gather(*render_tasks)
 
             # ── Phase 2: Build scene video ────────────────────────────────────
             # One ffmpeg call: scale → time-ranged subtitle overlays → concat the
@@ -921,26 +961,59 @@ class AssetBasedPipeline(LinearVideoPipeline):
         if not narrations:
             raise ValueError("文案段落为空，请至少添加一段文案内容。")
 
-        # 2. Distribute segments across assets (sequential equal-size bucketing)
+        # 2. Map segments ↔ assets so that EVERY uploaded asset appears.
         assets = list(self.asset_index.keys())
         n, m = len(narrations), len(assets)
 
         scenes = []
-        for asset_idx, asset_path in enumerate(assets):
-            start = asset_idx * n // m
-            end = (asset_idx + 1) * n // m
-            bucket = narrations[start:end]
-            if not bucket:
-                continue  # fewer segments than assets — skip this asset
-
-            bucket_styles = narration_styles_flat[start:end] if narration_styles_flat else []
-            scenes.append({
-                "scene_number": len(scenes) + 1,
-                "asset_path": asset_path,
-                "narrations": bucket,
-                "narration_styles": bucket_styles,
-                "duration": len(bucket) * 5,  # rough estimate only
-            })
+        if m <= n:
+            # Fewer (or equal) assets than segments: each asset is one scene and
+            # absorbs a contiguous bucket of segments (sequential equal-size
+            # bucketing). Every asset gets ≥1 segment, every segment is used.
+            for asset_idx, asset_path in enumerate(assets):
+                start = asset_idx * n // m
+                end = (asset_idx + 1) * n // m
+                bucket = narrations[start:end]
+                bucket_styles = (
+                    narration_styles_flat[start:end] if narration_styles_flat else []
+                )
+                scenes.append({
+                    "scene_number": len(scenes) + 1,
+                    "asset_path": asset_path,
+                    "narrations": bucket,
+                    "narration_styles": bucket_styles,
+                    "duration": len(bucket) * 5,  # rough estimate only
+                })
+        else:
+            # More assets than segments: a single segment must SPAN several assets.
+            # Spread the assets across the segments, then split that segment's text
+            # into one sub-narration per assigned asset so each asset becomes its
+            # own scene (carrying the parent segment's subtitle style). This way all
+            # m assets appear instead of the surplus being dropped.
+            base, extra = divmod(m, n)  # base assets per segment, first `extra` get +1
+            cursor = 0
+            for seg_idx in range(n):
+                k = base + (1 if seg_idx < extra else 0)  # assets for this segment
+                seg_assets = assets[cursor:cursor + k]
+                cursor += k
+                seg_style = (
+                    narration_styles_flat[seg_idx] if seg_idx < len(narration_styles_flat) else None
+                )
+                parts = self._split_text_into_n(narrations[seg_idx], k)
+                if len(parts) < len(seg_assets):
+                    logger.warning(
+                        f"⚠️  Segment {seg_idx + 1} too short to split across {k} assets "
+                        f"(got {len(parts)} parts); {len(seg_assets) - len(parts)} asset(s) "
+                        f"in this segment will be skipped."
+                    )
+                for part_text, asset_path in zip(parts, seg_assets):
+                    scenes.append({
+                        "scene_number": len(scenes) + 1,
+                        "asset_path": asset_path,
+                        "narrations": [part_text],
+                        "narration_styles": [seg_style] if seg_style else [],
+                        "duration": 5,  # rough estimate only
+                    })
 
         context.script = scenes
 
@@ -957,6 +1030,59 @@ class AssetBasedPipeline(LinearVideoPipeline):
         return context
 
     # Helper methods
+
+    @staticmethod
+    def _split_text_into_n(text: str, n: int) -> list:
+        """
+        Split `text` into `n` non-empty, length-balanced parts in reading order.
+
+        Used when a single narration segment must span multiple assets: each part
+        becomes one asset's scene. Splits at natural boundaries first (sentence /
+        clause / phrase punctuation); if there are fewer such units than `n`, falls
+        back to splitting the longest unit by character count so that — for any text
+        with at least `n` characters — exactly `n` parts are returned.
+        """
+        import re
+
+        text = " ".join((text or "").split())
+        if n <= 1 or not text:
+            return [text] if text else [""]
+
+        # Primary boundaries: keep the delimiter attached to the preceding clause.
+        units = [u for u in re.split(r'(?<=[。！？!?，；,;、])', text) if u.strip()]
+        if not units:
+            units = [text]
+
+        # If we don't have enough units, repeatedly split the longest unit in half
+        # at a whitespace/char midpoint until we have at least `n` units.
+        while len(units) < n and any(len(u) > 1 for u in units):
+            li = max(range(len(units)), key=lambda i: len(units[i]))
+            longest = units[li]
+            if len(longest) <= 1:
+                break
+            mid = len(longest) // 2
+            units[li:li + 1] = [longest[:mid], longest[mid:]]
+
+        # Greedily group units into `n` length-balanced, contiguous buckets.
+        total = sum(len(u) for u in units)
+        target = total / n
+        buckets: list = []
+        current = ""
+        for u in units:
+            # Close the current bucket once it reaches the target size, but always
+            # leave at least one bucket open for the remaining units.
+            if current and len(current) >= target and (n - len(buckets)) > 1:
+                buckets.append(current)
+                current = u
+            else:
+                current += u
+        if current:
+            buckets.append(current)
+
+        # Normalise to exactly n parts (defensive; pad/merge edge cases).
+        if len(buckets) > n:
+            buckets[n - 1:] = ["".join(buckets[n - 1:])]
+        return buckets
 
     def _get_asset_type(self, path: Path) -> str:
         """Determine asset type from file extension"""
@@ -1092,7 +1218,7 @@ class AssetBasedPipeline(LinearVideoPipeline):
         # Normalise + scale the source: constant fps/timebase/SAR, reset PTS.
         norm = (
             f"[0:v]fps=30,"
-            f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+            f"scale={W}:{H}:force_original_aspect_ratio=decrease:flags=lanczos,"
             f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,"
             f"setsar=1,settb=AVTB,setpts=PTS-STARTPTS"
         )
@@ -1118,11 +1244,17 @@ class AssetBasedPipeline(LinearVideoPipeline):
         parts.append(f"{vref}trim=duration={total_dur:.4f},setpts=PTS-STARTPTS[vout]")
         parts += self._audio_concat_chain(audios, base_idx=1 + K)
 
+        # Intermediate scene segment: encode near-LOSSLESS. This file is an
+        # intermediate that concat_videos_with_transition re-encodes again, so any
+        # quality lost here is permanent generational loss for zero benefit. crf 14
+        # is visually lossless; -preset veryfast keeps it fast (preset only trades
+        # size/speed, not quality at a fixed crf). The single user-visible encode is
+        # the final concat pass.
         cmd += [
             "-filter_complex", "; ".join(parts),
             "-map", "[vout]", "-map", "[aout]",
             "-c:v", "libx264", "-c:a", "aac",
-            "-pix_fmt", "yuv420p", "-crf", "23", "-preset", "medium",
+            "-pix_fmt", "yuv420p", "-crf", "14", "-preset", "veryfast",
             output,
         ]
 
@@ -1161,7 +1293,7 @@ class AssetBasedPipeline(LinearVideoPipeline):
 
         parts = [
             f"[0:v]fps=30,"
-            f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+            f"scale={W}:{H}:force_original_aspect_ratio=decrease:flags=lanczos,"
             f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,"
             f"setsar=1,settb=AVTB,setpts=PTS-STARTPTS[scaled]"
         ]
@@ -1172,11 +1304,13 @@ class AssetBasedPipeline(LinearVideoPipeline):
         parts.append(f"{vref}trim=duration={total_dur:.4f},setpts=PTS-STARTPTS[vout]")
         parts += self._audio_concat_chain(audios, base_idx=1 + K)
 
+        # Near-lossless intermediate (see _build_video_scene): the final concat
+        # pass is the only user-visible encode, so don't lose quality here.
         cmd += [
             "-filter_complex", "; ".join(parts),
             "-map", "[vout]", "-map", "[aout]",
             "-c:v", "libx264", "-c:a", "aac",
-            "-pix_fmt", "yuv420p", "-crf", "23", "-preset", "medium",
+            "-pix_fmt", "yuv420p", "-crf", "14", "-preset", "veryfast",
             output,
         ]
 

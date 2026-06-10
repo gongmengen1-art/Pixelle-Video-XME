@@ -113,8 +113,13 @@ class AssetBasedPipelineUI(PipelineUI):
                 temp_dir = Path(f"temp/assets_{session_id}")
                 temp_dir.mkdir(parents=True, exist_ok=True)
                 
-                for uploaded_file in uploaded_files:
-                    file_path = temp_dir / uploaded_file.name
+                for idx, uploaded_file in enumerate(uploaded_files):
+                    # Prefix with the upload index so that files sharing the same
+                    # original name (e.g. several "videoplayback (1).mp4") don't
+                    # overwrite each other on disk and don't collapse to the same
+                    # path downstream. Without this, uploading N files whose names
+                    # aren't all unique silently yields fewer than N assets.
+                    file_path = temp_dir / f"{idx:02d}_{uploaded_file.name}"
                     with open(file_path, "wb") as f:
                         f.write(uploaded_file.getbuffer())
                     asset_paths.append(str(file_path.absolute()))
@@ -613,85 +618,115 @@ class AssetBasedPipelineUI(PipelineUI):
                     ))
                     
                     total_time = time.time() - start_time
-                    
+
                     progress_bar.progress(100)
                     status_text.text(tr("status.success"))
-                    
-                    # Display result
-                    st.success(tr("status.video_generated", path=ctx.final_video_path))
-                    
-                    st.markdown("---")
-                    
-                    # Video info
+
+                    # Persist the result into session_state so it survives the
+                    # reruns triggered by any later DOM interaction (adding a
+                    # paragraph, tweaking duration, etc.). A single fixed key is
+                    # overwritten on every generation, so a second run naturally
+                    # replaces the first and we always show the latest video.
                     if os.path.exists(ctx.final_video_path):
-                        file_size_mb = os.path.getsize(ctx.final_video_path) / (1024 * 1024)
-                        n_scenes = len(ctx.storyboard.frames) if ctx.storyboard else 0
-                        
-                        info_text = (
-                            f"⏱️ {tr('info.generation_time')} {total_time:.1f}s   "
-                            f"📦 {file_size_mb:.2f}MB   "
-                            f"🎬 {n_scenes}{tr('info.scenes_unit')}"
-                        )
-                        st.caption(info_text)
-                        
-                        st.markdown("---")
-                        
-                        # Video preview
-                        st.video(ctx.final_video_path)
-                        
-                        # Download button
-                        with open(ctx.final_video_path, "rb") as video_file:
-                            video_bytes = video_file.read()
-                            video_filename = os.path.basename(ctx.final_video_path)
-                            st.download_button(
-                                label="⬇️ 下载视频" if get_language() == "zh_CN" else "⬇️ Download Video",
-                                data=video_bytes,
-                                file_name=video_filename,
-                                mime="video/mp4",
-                                use_container_width=True
-                            )
-
-                        # Quick entry to the Publish tab (semi-auto publish).
-                        # st.tabs can't be switched programmatically, so we stash
-                        # the video path in session_state and ask the user to
-                        # click the Publish tab (which pre-fills from it).
-                        if st.button(
-                            tr("asset_based.go_publish", fallback="📤 去发布到抖音/小红书"),
-                            use_container_width=True,
-                            key="asset_go_publish",
-                        ):
-                            st.session_state["publish_video_path"] = ctx.final_video_path
-                            st.session_state["publish_title"] = video_params.get("video_title", "")
-                            st.toast(tr(
-                                "asset_based.go_publish_hint",
-                                fallback="已暂存视频，请点击上方【📤 一键发布】标签页继续",
-                            ))
-
-                        # Cover preview + download (if cover was generated)
-                        cover_path = getattr(ctx, "cover_path", None)
-                        if cover_path and os.path.exists(cover_path):
-                            st.markdown("---")
-                            st.image(cover_path, caption=tr("asset_based.section.cover"), use_container_width=True)
-                            with open(cover_path, "rb") as cover_file:
-                                cover_ext = os.path.splitext(cover_path)[1] or ".jpg"
-                                cover_filename = os.path.basename(cover_path)
-                                st.download_button(
-                                    label=tr("asset_based.cover.download"),
-                                    data=cover_file.read(),
-                                    file_name=cover_filename,
-                                    mime=f"image/{cover_ext.lstrip('.').replace('jpg', 'jpeg')}",
-                                    use_container_width=True,
-                                    key="download_cover"
-                                )
+                        st.session_state["asset_result"] = {
+                            "video_path": ctx.final_video_path,
+                            "video_title": video_params.get("video_title", ""),
+                            "total_time": total_time,
+                            "n_scenes": len(ctx.storyboard.frames) if ctx.storyboard else 0,
+                            "file_size_mb": os.path.getsize(ctx.final_video_path) / (1024 * 1024),
+                            "cover_path": getattr(ctx, "cover_path", None),
+                        }
                     else:
+                        st.session_state.pop("asset_result", None)
                         st.error(tr("status.video_not_found", path=ctx.final_video_path))
-                
+
                 except Exception as e:
                     status_text.text("")
                     progress_bar.empty()
                     st.error(tr("status.error", error=str(e)))
                     logger.exception(e)
                     st.stop()
+                finally:
+                    # Clear the transient progress widgets; the result below is
+                    # rendered from session_state and persists across reruns.
+                    progress_bar.empty()
+                    status_text.empty()
+
+            # Render the most recent result (if any). Lives OUTSIDE the generate
+            # button block so it re-renders on every rerun rather than vanishing
+            # the moment another widget triggers one.
+            self._render_result()
+
+    def _render_result(self):
+        """Render the latest generated video from session_state (rerun-safe)."""
+        result = st.session_state.get("asset_result")
+        if not result:
+            return
+
+        video_path = result.get("video_path")
+        if not video_path or not os.path.exists(video_path):
+            # Output file was cleaned up / moved since generation.
+            st.session_state.pop("asset_result", None)
+            return
+
+        st.success(tr("status.video_generated", path=video_path))
+        st.markdown("---")
+
+        info_text = (
+            f"⏱️ {tr('info.generation_time')} {result.get('total_time', 0):.1f}s   "
+            f"📦 {result.get('file_size_mb', 0):.2f}MB   "
+            f"🎬 {result.get('n_scenes', 0)}{tr('info.scenes_unit')}"
+        )
+        st.caption(info_text)
+        st.markdown("---")
+
+        # Video preview
+        st.video(video_path)
+
+        # Download button
+        with open(video_path, "rb") as video_file:
+            video_bytes = video_file.read()
+            video_filename = os.path.basename(video_path)
+            st.download_button(
+                label="⬇️ 下载视频" if get_language() == "zh_CN" else "⬇️ Download Video",
+                data=video_bytes,
+                file_name=video_filename,
+                mime="video/mp4",
+                use_container_width=True,
+                key="download_video",
+            )
+
+        # Quick entry to the Publish tab (semi-auto publish).
+        # st.tabs can't be switched programmatically, so we stash the video
+        # path in session_state and ask the user to click the Publish tab.
+        if st.button(
+            tr("asset_based.go_publish", fallback="📤 去发布到抖音/小红书"),
+            use_container_width=True,
+            key="asset_go_publish",
+        ):
+            st.session_state["publish_video_path"] = video_path
+            st.session_state["publish_title"] = result.get("video_title", "")
+            st.toast(tr(
+                "asset_based.go_publish_hint",
+                fallback="已暂存视频，请点击上方【📤 一键发布】标签页继续",
+            ))
+
+        # Cover preview + download (if a cover was generated)
+        cover_path = result.get("cover_path")
+        if cover_path and os.path.exists(cover_path):
+            st.markdown("---")
+            st.image(cover_path, caption=tr("asset_based.section.cover"), use_container_width=True)
+            with open(cover_path, "rb") as cover_file:
+                cover_ext = os.path.splitext(cover_path)[1] or ".jpg"
+                cover_filename = os.path.basename(cover_path)
+                st.download_button(
+                    label=tr("asset_based.cover.download"),
+                    data=cover_file.read(),
+                    file_name=cover_filename,
+                    mime=f"image/{cover_ext.lstrip('.').replace('jpg', 'jpeg')}",
+                    use_container_width=True,
+                    key="download_cover",
+                )
 
 
 # Register self

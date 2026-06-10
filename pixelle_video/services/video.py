@@ -383,7 +383,10 @@ class VideoService:
             "-vcodec", "libx264",
             "-acodec", "aac",
             "-pix_fmt", "yuv420p",
-            "-crf", "23",
+            # This is the single user-visible encode of the whole pipeline (scene
+            # segments feeding in are near-lossless). crf 18 is visually near
+            # transparent; the slightly larger file is the right trade for fidelity.
+            "-crf", "18",
             "-preset", "medium",
             "-y",
             concat_output,

@@ -24,7 +24,14 @@ import certifi
 import edge_tts as edge_tts_sdk
 from edge_tts.exceptions import NoAudioReceived
 from loguru import logger
-from aiohttp import WSServerHandshakeError, ClientResponseError
+from aiohttp import (
+    WSServerHandshakeError,
+    ClientResponseError,
+    ClientConnectorError,
+    ClientOSError,
+    ServerDisconnectedError,
+    ClientConnectionError,
+)
 
 
 # Use certifi bundle for SSL verification instead of disabling it
@@ -34,6 +41,23 @@ _USE_CERTIFI_SSL = True
 _RETRY_COUNT = 5           # Default retry count
 _RETRY_BASE_DELAY = 1.0     # Base retry delay in seconds (for exponential backoff)
 _MAX_RETRY_DELAY = 10.0     # Maximum retry delay in seconds
+
+# Transient network errors that should be retried rather than failing the whole
+# pipeline. Connecting to Microsoft's Edge TTS endpoint (speech.platform.bing.com)
+# is flaky — SSL handshake resets / connection drops are common and almost always
+# succeed on a retry. aiohttp wraps OS-level ConnectionResetError in
+# ClientConnectorError/ClientOSError, so we cover both the aiohttp wrappers and the
+# builtin connection errors.
+_RETRYABLE_NETWORK_ERRORS = (
+    ClientConnectorError,
+    ClientOSError,
+    ServerDisconnectedError,
+    ClientConnectionError,
+    ConnectionResetError,
+    ConnectionError,
+    TimeoutError,
+    asyncio.TimeoutError,
+)
 
 # Rate limiting configuration
 _REQUEST_DELAY = 0.5        # Minimum delay before each request (seconds)
@@ -211,7 +235,20 @@ async def edge_tts(
                     raise
                 # Add extra delay for NoAudioReceived errors
                 await asyncio.sleep(2.0)
-            
+
+            except _RETRYABLE_NETWORK_ERRORS as e:
+                # Transient connection error (e.g. SSL handshake reset against
+                # speech.platform.bing.com) - retry instead of failing the pipeline
+                last_error = e
+                logger.warning(
+                    f"⚠️  Edge TTS network error (attempt {attempt + 1}/{retry_count + 1}): "
+                    f"{type(e).__name__} - {e}"
+                )
+                if attempt >= retry_count:
+                    logger.error(f"❌ All {retry_count + 1} attempts failed. Last error: {type(e).__name__}")
+                    raise
+                # Otherwise, continue to next retry
+
             except Exception as e:
                 # Other errors - don't retry, raise immediately
                 logger.error(f"Edge TTS error (non-retryable): {type(e).__name__} - {e}")
@@ -307,6 +344,16 @@ async def edge_tts_with_boundaries(
                 if attempt >= retry_count:
                     raise
                 await asyncio.sleep(2.0)
+            except _RETRYABLE_NETWORK_ERRORS as e:
+                # Transient connection error (e.g. SSL handshake reset against
+                # speech.platform.bing.com) - retry instead of failing the pipeline
+                last_error = e
+                logger.warning(
+                    f"⚠️  Edge TTS boundary network error "
+                    f"(attempt {attempt + 1}/{retry_count + 1}): {type(e).__name__} - {e}"
+                )
+                if attempt >= retry_count:
+                    raise
             except Exception as e:
                 logger.error(f"Edge TTS boundary error (non-retryable): {type(e).__name__} - {e}")
                 raise
@@ -426,7 +473,18 @@ async def list_voices(locale: str = None, retry_count: int = _RETRY_COUNT, retry
                 if attempt >= retry_count:
                     logger.error(f"❌ All {retry_count + 1} attempts failed. Last error: {error_code}")
                     raise
-            
+
+            except _RETRYABLE_NETWORK_ERRORS as e:
+                # Transient connection error - retry
+                last_error = e
+                logger.warning(
+                    f"⚠️  List voices network error (attempt {attempt + 1}/{retry_count + 1}): "
+                    f"{type(e).__name__} - {e}"
+                )
+                if attempt >= retry_count:
+                    logger.error(f"❌ All {retry_count + 1} attempts failed. Last error: {type(e).__name__}")
+                    raise
+
             except Exception as e:
                 # Other errors - don't retry, raise immediately
                 logger.error(f"List voices error (non-retryable): {type(e).__name__} - {e}")
