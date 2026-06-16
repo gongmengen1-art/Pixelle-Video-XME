@@ -211,6 +211,8 @@ class AssetBasedPipelineUI(PipelineUI):
             for key in SUBTITLE_STYLE_CSS
         }
 
+        st.caption(tr("asset_based.script.emphasis_hint"))
+
         delete_idx = None
         for i in range(n):
             col_text, col_style, col_del = st.columns([5, 3, 1])
@@ -367,11 +369,23 @@ class AssetBasedPipelineUI(PipelineUI):
                 )
                 st.caption(tr("asset_based.subtitle.chars_per_line_label", n=subtitle_chars_per_line))
 
+            # Row 3: emphasis (重点字) colour — applied to text wrapped in [[ ]]
+            from pixelle_video.utils.subtitle import DEFAULT_EMPHASIS_COLOR
+            col_emph, _col_pad = st.columns([2, 3])
+            with col_emph:
+                subtitle_emphasis_color = st.color_picker(
+                    tr("asset_based.subtitle.emphasis_color"),
+                    value=DEFAULT_EMPHASIS_COLOR,
+                    key="asset_subtitle_emphasis_color",
+                )
+            st.caption(tr("asset_based.subtitle.emphasis_help"))
+
         return {
             "subtitle_style": subtitle_style,
             "subtitle_position": subtitle_position,
             "subtitle_max_lines": subtitle_max_lines,
             "subtitle_chars_per_line": subtitle_chars_per_line,
+            "subtitle_emphasis_color": subtitle_emphasis_color,
         }
 
     def _render_video_config(self, pixelle_video: Any) -> dict:
@@ -443,61 +457,92 @@ class AssetBasedPipelineUI(PipelineUI):
         # TTS configuration
         with st.container(border=True):
             st.markdown(f"**{tr('section.tts')}**")
-            
-            # Import voice configuration
+
             from pixelle_video.tts_voices import EDGE_TTS_VOICES, get_voice_display_name
-            
-            # Get saved voice from config
+
             comfyui_config = config_manager.get_comfyui_config()
             tts_config = comfyui_config.get("tts", {})
             local_config = tts_config.get("local", {})
             saved_voice = local_config.get("voice", "zh-CN-YunjianNeural")
             saved_speed = local_config.get("speed", 1.2)
-            
-            # Build voice options with i18n
-            voice_options = []
-            voice_ids = []
-            default_voice_index = 0
-            
-            for idx, voice_config in enumerate(EDGE_TTS_VOICES):
-                voice_id = voice_config["id"]
-                display_name = get_voice_display_name(voice_id, tr, get_language())
-                voice_options.append(display_name)
-                voice_ids.append(voice_id)
-                
-                if voice_id == saved_voice:
-                    default_voice_index = idx
-            
-            # Two-column layout
-            voice_col, speed_col = st.columns([1, 1])
-            
-            with voice_col:
-                selected_voice_display = st.selectbox(
-                    tr("tts.voice_selector"),
-                    voice_options,
-                    index=default_voice_index,
-                    key="asset_tts_voice"
+
+            # Voice backend: Edge preset voices vs VoxCPM voice cloning (RunningHub).
+            backend_options = {
+                "edge": tr("tts.backend.edge"),
+                "voxcpm_clone": tr("tts.backend.voxcpm_clone"),
+            }
+            tts_backend = st.radio(
+                tr("tts.backend"),
+                options=list(backend_options.keys()),
+                format_func=lambda x: backend_options[x],
+                horizontal=True,
+                key="asset_tts_backend",
+            )
+
+            # Per-backend outputs (defaults overridden below)
+            voice_id = None
+            tts_speed = saved_speed
+            tts_inference_mode = "local"
+            tts_workflow = None
+            ref_audio_path = None
+
+            if tts_backend == "edge":
+                voice_options, voice_ids, default_voice_index = [], [], 0
+                for idx, voice_config in enumerate(EDGE_TTS_VOICES):
+                    vid = voice_config["id"]
+                    voice_options.append(get_voice_display_name(vid, tr, get_language()))
+                    voice_ids.append(vid)
+                    if vid == saved_voice:
+                        default_voice_index = idx
+
+                voice_col, speed_col = st.columns([1, 1])
+                with voice_col:
+                    selected_voice_display = st.selectbox(
+                        tr("tts.voice_selector"),
+                        voice_options,
+                        index=default_voice_index,
+                        key="asset_tts_voice",
+                    )
+                    voice_id = voice_ids[voice_options.index(selected_voice_display)]
+                with speed_col:
+                    tts_speed = st.slider(
+                        tr("tts.speed"),
+                        min_value=0.5, max_value=2.0, value=saved_speed,
+                        step=0.1, format="%.1fx", key="asset_tts_speed",
+                    )
+                    st.caption(tr("tts.speed_label", speed=f"{tts_speed:.1f}"))
+            else:  # voxcpm_clone — clone an uploaded voice via RunningHub VoxCPM2
+                tts_inference_mode = "comfyui"
+                tts_workflow = "runninghub/tts_voxcpm.json"
+                tts_speed = None  # VoxCPM workflow exposes no speed control
+                st.caption(tr("tts.voxcpm.clone_hint"))
+                ref_audio_file = st.file_uploader(
+                    tr("tts.ref_audio"),
+                    type=["wav", "mp3", "m4a", "flac"],
+                    help=tr("tts.ref_audio_help"),
+                    key="asset_voxcpm_ref_audio",
                 )
-                selected_voice_index = voice_options.index(selected_voice_display)
-                voice_id = voice_ids[selected_voice_index]
-            
-            with speed_col:
-                tts_speed = st.slider(
-                    tr("tts.speed"),
-                    min_value=0.5,
-                    max_value=2.0,
-                    value=saved_speed,
-                    step=0.1,
-                    format="%.1fx",
-                    key="asset_tts_speed"
-                )
-                st.caption(tr("tts.speed_label", speed=f"{tts_speed:.1f}"))
-        
+                if ref_audio_file is not None:
+                    st.audio(ref_audio_file)
+                    import uuid
+                    session_id = str(uuid.uuid4()).replace("-", "")[:12]
+                    temp_dir = Path(f"temp/ref_audio_{session_id}")
+                    temp_dir.mkdir(parents=True, exist_ok=True)
+                    ref_path = temp_dir / ref_audio_file.name
+                    with open(ref_path, "wb") as f:
+                        f.write(ref_audio_file.getbuffer())
+                    ref_audio_path = str(ref_path.absolute())
+                else:
+                    st.warning(tr("tts.voxcpm.need_ref"))
+
         return {
             "duration": duration,
             "source": source,
             "voice_id": voice_id,
-            "tts_speed": tts_speed
+            "tts_speed": tts_speed,
+            "tts_inference_mode": tts_inference_mode,
+            "tts_workflow": tts_workflow,
+            "ref_audio": ref_audio_path,
         }
     
     def _render_output_preview(self, pixelle_video: Any, video_params: dict):
@@ -605,6 +650,9 @@ class AssetBasedPipelineUI(PipelineUI):
                         bgm_mode=video_params.get("bgm_mode", "loop"),
                         voice_id=video_params.get("voice_id", "zh-CN-YunjianNeural"),
                         tts_speed=video_params.get("tts_speed", 1.2),
+                        tts_inference_mode=video_params.get("tts_inference_mode", "local"),
+                        tts_workflow=video_params.get("tts_workflow"),
+                        ref_audio=video_params.get("ref_audio"),
                         script_mode=video_params.get("script_mode", "generate"),
                         fixed_script=video_params.get("fixed_script"),
                         fixed_segments=video_params.get("fixed_segments"),

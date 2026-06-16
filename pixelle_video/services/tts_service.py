@@ -145,10 +145,17 @@ class TTSService(ComfyBaseService):
         speed: Optional[float] = None,
         output_path: Optional[str] = None,
         inference_mode: Optional[str] = None,
+        workflow: Optional[str] = None,
+        **params,
     ) -> tuple[str, Optional[list]]:
         """
         Synthesize speech for a full text in one continuous utterance and return
         word-level timing when the backend supports it.
+
+        For ComfyUI/remote backends, `workflow` selects the TTS workflow and any
+        extra keyword args (e.g. ref_audio for voice cloning) are forwarded to the
+        workflow as parameters; None-valued extras are dropped so they don't
+        overwrite the workflow's own defaults.
 
         Returns:
             (audio_path, boundaries) where boundaries is a list of
@@ -160,10 +167,15 @@ class TTSService(ComfyBaseService):
 
         if mode != "local":
             # ComfyUI / remote backends: no word timing available.
-            path = await self.__call__(
+            extra = {k: v for k, v in params.items() if v is not None}
+            call_kwargs = dict(
                 text=text, voice=voice, speed=speed,
                 output_path=output_path, inference_mode=mode,
             )
+            if workflow:
+                call_kwargs["workflow"] = workflow
+            call_kwargs.update(extra)
+            path = await self.__call__(**call_kwargs)
             return path, None
 
         from pixelle_video.utils.tts_util import edge_tts_with_boundaries

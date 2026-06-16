@@ -491,9 +491,11 @@ class AssetBasedPipeline(LinearVideoPipeline):
             min_narration_words=5,
             max_narration_words=50,
             video_fps=30,
-            tts_inference_mode="local",
+            tts_inference_mode=context.params.get("tts_inference_mode", "local"),
             voice_id=context.params.get("voice_id", "zh-CN-YunjianNeural"),
             tts_speed=context.params.get("tts_speed", 1.2),
+            tts_workflow=context.params.get("tts_workflow"),
+            ref_audio=context.params.get("ref_audio"),
             media_width=media_width,
             media_height=media_height,
             frame_template=template_name,
@@ -564,7 +566,8 @@ class AssetBasedPipeline(LinearVideoPipeline):
         from pixelle_video.utils.template_util import resolve_template_path
         from pixelle_video.utils.subtitle import (
             build_subtitle_template_vars,
-            format_subtitle_text,
+            parse_emphasis,
+            build_subtitle_inner_html,
             split_narration_into_subtitle_chunks,
             map_subtitle_chunks_to_timeline,
         )
@@ -639,6 +642,14 @@ class AssetBasedPipeline(LinearVideoPipeline):
                 })
                 max_lines = int(sub_vars["_subtitle_max_lines"])
                 chars_per_line = int(sub_vars["_subtitle_chars_per_line"])
+                emphasis_color = sub_vars["_subtitle_emphasis_color"]
+
+                # 0. Strip [[ ]] emphasis markers up front. clean_text (markers
+                #    removed, whitespace collapsed) drives TTS, chunking and
+                #    alignment — exactly as before — so speech and timing are
+                #    unaffected. emph_flags marks which clean_text chars to
+                #    highlight when rendering the subtitle PNG.
+                clean_text, emph_flags = parse_emphasis(narration_text)
 
                 # 1. ONE continuous TTS for the whole paragraph (with word timing)
                 self._emit_progress(ProgressEvent(
@@ -647,8 +658,11 @@ class AssetBasedPipeline(LinearVideoPipeline):
                 ))
                 audio_path = str(frames_dir / f"{i:02d}_n{j}.mp3")
                 _, boundaries = await self.core.tts.synth_with_word_boundaries(
-                    text=narration_text, output_path=audio_path,
+                    text=clean_text, output_path=audio_path,
                     voice=config.voice_id, speed=config.tts_speed,
+                    inference_mode=config.tts_inference_mode,
+                    workflow=config.tts_workflow,
+                    ref_audio=config.ref_audio,
                 )
 
                 # 2. Continuous-audio duration
@@ -659,16 +673,20 @@ class AssetBasedPipeline(LinearVideoPipeline):
                 scene_audios.append(audio_path)
 
                 # 3. Subtitle chunks (display only) + their time windows
-                chunks = split_narration_into_subtitle_chunks(narration_text, max_lines, chars_per_line)
+                chunks = split_narration_into_subtitle_chunks(clean_text, max_lines, chars_per_line)
                 timings = map_subtitle_chunks_to_timeline(
-                    narration_text, chunks, boundaries, narr_dur
+                    clean_text, chunks, boundaries, narr_dur
                 )
                 logger.debug(
                     f"  Scene {i} narration {j}: {len(chunks)} chunk(s), "
                     f"{narr_dur:.2f}s, {'word-aligned' if boundaries else 'proportional'}"
                 )
 
-                # 4. Render subtitle PNG per chunk; window offset by scene cursor
+                # 4. Render subtitle PNG per chunk; window offset by scene cursor.
+                #    flag_cursor tracks each chunk's char offset inside clean_text
+                #    so we can slice out the matching emphasis flags (chunks are
+                #    contiguous substrings of clean_text).
+                flag_cursor = 0
                 for c, (chunk_text, (ct0, cdur)) in enumerate(zip(chunks, timings), 1):
                     self._emit_progress(ProgressEvent(
                         event_type="frame_step", progress=min(progress + 0.01, 0.99),
@@ -685,9 +703,19 @@ class AssetBasedPipeline(LinearVideoPipeline):
                     # subtitle PNG is pure redundant work (and for video assets the
                     # .mp4 can't load as an <img> anyway). Dropping it makes each
                     # render an order of magnitude faster and the PNG smaller.
+                    # Slice this chunk's emphasis flags out of the paragraph.
+                    idx = clean_text.find(chunk_text, flag_cursor)
+                    if idx < 0:
+                        idx = flag_cursor
+                    chunk_flags = emph_flags[idx:idx + len(chunk_text)]
+                    flag_cursor = idx + len(chunk_text)
+
                     render_tasks.append(_render_subtitle(
                         title=storyboard.title,
-                        text=format_subtitle_text(chunk_text, max_lines, chars_per_line),
+                        text=build_subtitle_inner_html(
+                            chunk_text, chunk_flags, emphasis_color,
+                            max_lines, chars_per_line,
+                        ),
                         image="", ext=ext, output_path=composed_path,
                     ))
 
@@ -882,6 +910,9 @@ class AssetBasedPipeline(LinearVideoPipeline):
                 "source": ctx.request.get("source"),
                 "voice_id": ctx.request.get("voice_id"),
                 "tts_speed": ctx.request.get("tts_speed"),
+                "tts_inference_mode": ctx.request.get("tts_inference_mode"),
+                "tts_workflow": ctx.request.get("tts_workflow"),
+                "ref_audio": ctx.request.get("ref_audio"),
             }
             
             metadata = {

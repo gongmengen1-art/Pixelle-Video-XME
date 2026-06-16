@@ -2,8 +2,25 @@
 Subtitle utilities: style presets, position CSS, text formatting.
 """
 
+import html as _html
 import re
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
+
+# ── Emphasis (重点标记) ──────────────────────────────────────────────────────
+# Authors mark emphasised words in the custom script with [[ ]], e.g.
+#   "今天教大家一个[[超实用]]的小技巧。"
+# The markers are stripped before TTS / chunking / alignment (so speech and
+# timing are unaffected) and the wrapped characters are rendered with a
+# distinct colour + larger size + bold stroke in the subtitle PNG.
+EMPHASIS_OPEN = "[["
+EMPHASIS_CLOSE = "]]"
+DEFAULT_EMPHASIS_COLOR = "#FFE000"
+
+# Punctuation removed from the *displayed* subtitle only (kept for TTS so
+# prosody/pauses stay natural). Scope: sentence-end / pause marks. Quotes,
+# book-title marks, dashes and ellipsis are intentionally preserved.
+_DISPLAY_STRIP_CJK = set("。．！？，、；：")
+_DISPLAY_STRIP_ASCII = set(".,;:!?")
 
 SUBTITLE_STYLE_CSS: Dict[str, str] = {
     "simple_white": (
@@ -66,13 +83,189 @@ def build_subtitle_template_vars(params: Dict[str, Any]) -> Dict[str, Any]:
     position = params.get("subtitle_position", "bottom")
     max_lines = int(params.get("subtitle_max_lines", 2))
     chars_per_line = int(params.get("subtitle_chars_per_line", 20))
+    emphasis_color = params.get("subtitle_emphasis_color") or DEFAULT_EMPHASIS_COLOR
 
     return {
         "subtitle_style_css": SUBTITLE_STYLE_CSS.get(style, SUBTITLE_STYLE_CSS["simple_white"]),
         "subtitle_position_css": SUBTITLE_POSITION_CSS.get(position, SUBTITLE_POSITION_CSS["bottom"]),
         "_subtitle_max_lines": max_lines,
         "_subtitle_chars_per_line": chars_per_line,
+        "_subtitle_emphasis_color": emphasis_color,
     }
+
+
+def parse_emphasis(raw: str) -> Tuple[str, List[bool]]:
+    """
+    Strip [[ ]] emphasis markers from a narration paragraph and report which
+    characters were emphasised.
+
+    Returns (clean_text, flags) where:
+      • clean_text  — markers removed AND whitespace collapsed to single spaces
+        (identical to " ".join(stripped.split())), so it lines up exactly with
+        the `norm` text used by the chunking / timeline-alignment helpers.
+      • flags       — list[bool] parallel to clean_text; flags[i] is True when
+        clean_text[i] fell inside a [[ ]] pair.
+
+    Unmatched/standalone brackets are treated as literal text. Nested markers
+    just keep the depth > 0, so the inner text stays emphasised.
+    """
+    chars: List[str] = []
+    flags: List[bool] = []
+    depth = 0
+    prev_space = False
+    i, n = 0, len(raw)
+    while i < n:
+        if raw.startswith(EMPHASIS_OPEN, i):
+            depth += 1
+            i += 2
+            continue
+        if depth > 0 and raw.startswith(EMPHASIS_CLOSE, i):
+            depth -= 1
+            i += 2
+            continue
+        ch = raw[i]
+        i += 1
+        if ch.isspace():
+            # Collapse runs to a single space; drop leading space.
+            if chars and not prev_space:
+                chars.append(" ")
+                flags.append(False)
+                prev_space = True
+            continue
+        prev_space = False
+        chars.append(ch)
+        flags.append(depth > 0)
+    # Trim trailing space introduced by collapsing.
+    while chars and chars[-1] == " ":
+        chars.pop()
+        flags.pop()
+    return "".join(chars), flags
+
+
+def _strip_display_punct(text: str, flags: List[bool]) -> Tuple[List[str], List[bool]]:
+    """
+    Remove sentence-end / pause punctuation from display text, keeping the
+    emphasis flag of every surviving character aligned. ASCII '.' and ',' that
+    sit between digits (decimals / thousands separators) are preserved.
+    Consecutive / trailing spaces left behind by removal are collapsed.
+    """
+    out_c: List[str] = []
+    out_f: List[bool] = []
+    n = len(text)
+    for idx, ch in enumerate(text):
+        if ch in _DISPLAY_STRIP_CJK:
+            continue
+        if ch in _DISPLAY_STRIP_ASCII:
+            prev = text[idx - 1] if idx > 0 else ""
+            nxt = text[idx + 1] if idx + 1 < n else ""
+            if ch in ".," and prev.isdigit() and nxt.isdigit():
+                pass  # keep decimal / thousands separator
+            else:
+                continue
+        out_c.append(ch)
+        out_f.append(flags[idx] if idx < len(flags) else False)
+
+    # Collapse spaces created by stripping (e.g. "Hello , world" → "Hello world").
+    c2: List[str] = []
+    f2: List[bool] = []
+    prev_space = False
+    for ch, f in zip(out_c, out_f):
+        if ch == " ":
+            if prev_space or not c2:
+                continue
+            prev_space = True
+        else:
+            prev_space = False
+        c2.append(ch)
+        f2.append(f)
+    while c2 and c2[-1] == " ":
+        c2.pop()
+        f2.pop()
+    return c2, f2
+
+
+def build_emphasis_css(color: str = DEFAULT_EMPHASIS_COLOR) -> str:
+    """Inline CSS for an emphasised run: colour (configurable) + larger + bold."""
+    color = color or DEFAULT_EMPHASIS_COLOR
+    return (
+        f"color:{color};"
+        "font-size:1.25em;"
+        "font-weight:900;"
+        "-webkit-text-stroke:1.5px rgba(0,0,0,0.55);"
+        "padding:0 1px;"
+    )
+
+
+def _wrap_flagged(
+    chars: List[str], flags: List[bool], max_lines: int, chars_per_line: int
+) -> List[Tuple[List[str], List[bool]]]:
+    """
+    Wrap a flagged char list into <= max_lines lines of <= chars_per_line each,
+    breaking at spaces when possible (Latin) and hard-wrapping otherwise (CJK).
+    Mirrors format_subtitle_text's wrapping so layout is unchanged. Overflow
+    beyond max_lines is dropped (chunks are pre-sized to fit).
+    """
+    lines: List[Tuple[List[str], List[bool]]] = []
+    i, n = 0, len(chars)
+    while i < n and len(lines) < max_lines:
+        if n - i <= chars_per_line:
+            lines.append((chars[i:], flags[i:]))
+            break
+        window = chars[i:i + chars_per_line]
+        last_space = -1
+        for k in range(len(window) - 1, -1, -1):
+            if window[k] == " ":
+                last_space = k
+                break
+        if last_space > chars_per_line // 2:
+            lines.append((chars[i:i + last_space], flags[i:i + last_space]))
+            i += last_space + 1  # skip the breaking space
+        else:
+            lines.append((chars[i:i + chars_per_line], flags[i:i + chars_per_line]))
+            i += chars_per_line
+    return lines
+
+
+def _line_to_html(chars: List[str], flags: List[bool], emph_css: str) -> str:
+    """Render one line: consecutive emphasised chars are wrapped in a styled span."""
+    parts: List[str] = []
+    k, n = 0, len(chars)
+    while k < n:
+        f = flags[k]
+        j = k
+        while j < n and flags[j] == f:
+            j += 1
+        seg = _html.escape("".join(chars[k:j]))
+        parts.append(f'<span style="{emph_css}">{seg}</span>' if f else seg)
+        k = j
+    return "".join(parts)
+
+
+def build_subtitle_inner_html(
+    text: str,
+    flags: List[bool],
+    emphasis_color: str = DEFAULT_EMPHASIS_COLOR,
+    max_lines: int = 2,
+    chars_per_line: int = 20,
+) -> str:
+    """
+    Build the inner HTML for one subtitle chunk's <div class="text"> slot:
+      1. strip display punctuation (keeping emphasis flags aligned),
+      2. wrap into lines,
+      3. emit HTML-escaped text with emphasised runs wrapped in styled <span>s,
+         lines joined by '\\n' (template uses white-space: pre-line).
+
+    `flags` must be parallel to `text` (same length); pass all-False (or a short
+    list) when there is no emphasis.
+    """
+    if flags is None:
+        flags = []
+    if len(flags) < len(text):
+        flags = list(flags) + [False] * (len(text) - len(flags))
+    chars, fl = _strip_display_punct(text, flags)
+    lines = _wrap_flagged(chars, fl, max_lines, chars_per_line)
+    emph_css = build_emphasis_css(emphasis_color)
+    return "\n".join(_line_to_html(lc, lf, emph_css) for lc, lf in lines)
 
 
 def split_narration_into_subtitle_chunks(
